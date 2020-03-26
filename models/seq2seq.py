@@ -1,18 +1,6 @@
 import torch
 from typing import Tuple
-
-
-def sequence_mask(lengths: torch.Tensor, maxlen) -> torch.Tensor:
-    """
-    Something like `tensorflow.sequence_mask`.
-    :param lengths: `torch.Tensor`
-    :param maxlen: `int`
-    :return: `torch.Tensor` of dtype `torch.bool`
-    """
-    row_vector = torch.arange(0, maxlen, 1, device=lengths.device)
-    matrix = lengths.unsqueeze(dim=-1)
-    mask = row_vector < matrix
-    return mask
+from .attention import ConcatAttention
 
 
 class Encoder(torch.nn.Module):
@@ -27,42 +15,6 @@ class Encoder(torch.nn.Module):
         out, last_state = self.rnn(out)
         out = torch.nn.utils.rnn.pad_packed_sequence(out, batch_first=True)[0]
         return out, last_state
-
-
-class Attention(torch.nn.Module):
-    def __init__(self, in_features, hidden_dim):
-        super().__init__()
-        self.fc_w = torch.nn.Linear(in_features, hidden_dim, bias=False)
-        self.fc_v = torch.nn.Linear(hidden_dim, 1, bias=False)
-        self.mask_val = -50000
-
-    def forward(self, encoder_outputs: torch.Tensor, sequence_length: torch.Tensor, decoder_state: torch.Tensor):
-        """
-        s(x_i, x_j) = v^{T} tanh{W_1x_i+W_2x_j}
-        v \in \mathbb{R}^{hidden-dim}
-        :param encoder_outputs: torch.Tensor of shape [batch_size, enc_seq_len, enc_state_dim]
-        :param sequence_length: torch.Tensor of shape [batch_size]
-        :param decoder_state: torch.Tensor of shape [batch_size, dec_state_dim]
-        :return: torch.Tensor of shape [batch_size, enc_seq_len, enc_state_dim]
-        """
-        out = torch.cat([encoder_outputs, decoder_state.unsqueeze(1).expand([-1, encoder_outputs.size(1), -1])], dim=-1)
-        attn_logits = self.fc_w(out)  # [batch_size, enc_seq_len, hidden_dim]
-        attn_logits = attn_logits.tanh()
-        attn_logits = self.fc_v(attn_logits).squeeze(2)  # [batch_size, enc_seqlen]
-        attn_weight = self.masked_softmax(attn_logits, sequence_length).unsqueeze(1)  # [batch_size, 1, enc_seq_len]
-        out = torch.bmm(attn_weight, encoder_outputs).squeeze(1)
-        return out
-
-    def masked_softmax(self, logits: torch.Tensor, sequence_length: torch.Tensor) -> torch.Tensor:
-        """
-        :param logits: torch.Tensor of shape [batch_size, seq_len]
-        :param sequence_length: torch.Tensor of shape [batch_size]
-        :return: torch.Tensor of shape [batch_size, seq_len]
-        """
-        mask = sequence_mask(sequence_length, maxlen=logits.size(1)).to(logits.device)
-        masked_logits = torch.where(mask, logits, torch.empty_like(logits).fill_(self.mask_val))
-        out = torch.softmax(masked_logits, dim=1)
-        return out
 
 
 class Decoder(torch.nn.Module):
@@ -108,7 +60,7 @@ class Seq2SeqAttn(torch.nn.Module):
         dec_rnn_cell = torch.nn.GRUCell(input_size=2 * enc_hidden_dim + embedding_dim_e, hidden_size=dec_hidden_dim)
         self.decoder = Decoder(dec_embd, rnn_cell=dec_rnn_cell)
 
-        self.attn = Attention(2 * enc_hidden_dim + dec_hidden_dim, hidden_dim=8)
+        self.attn = ConcatAttention(2 * enc_hidden_dim + dec_hidden_dim, hidden_dim=8)
         self.clf = torch.nn.Sequential(torch.nn.Linear(dec_hidden_dim, vocab_size_e),
                                        torch.nn.ReLU())
 
@@ -131,24 +83,8 @@ class Seq2SeqAttn(torch.nn.Module):
                 - state: torch.Tensor of shape [batch_size, decoder_hidden_dim], updated state of decoder
         """
         out, last_state = self.encoder(encoder_inputs, encoder_seq_length)
-        context = self.attn(encoder_outputs=out, sequence_length=encoder_seq_length, decoder_state=decoder_state)
+        context, _ = self.attn(encoder_outputs=out, sequence_length=encoder_seq_length, decoder_state=decoder_state)
         new_state = self.decoder(decoder_cur_inputs, decoder_state, context)
         out = self.clf(new_state)
         return out, new_state
 
-
-if __name__ == "__main__":
-    device = None
-    if torch.cuda.is_available():
-        device = torch.device("cuda:0")
-    enc_inputs = torch.tensor([[1, 2, 3, 4], [1, 2, 3, 0]], device=device)
-    sequence_length = torch.tensor([4, 3])
-    enc_hidden_dim = 100
-    dec_hidden_dim = 200
-    dec_cur_input = torch.tensor([1, 2], device=device)
-    nn = Seq2SeqAttn(vocab_size_f=100, embedding_dim_f=64, vocab_size_e=100, embedding_dim_e=64,
-                     enc_hidden_dim=enc_hidden_dim,
-                     dec_hidden_dim=dec_hidden_dim).to(device)
-    dec_state = torch.zeros([dec_cur_input.size(0), dec_hidden_dim], device=dec_cur_input.device)
-    for i in range(5):
-        out, dec_state = nn.decode_one_step_forward(enc_inputs, sequence_length, dec_cur_input, dec_state)
