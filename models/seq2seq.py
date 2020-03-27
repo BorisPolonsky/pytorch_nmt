@@ -63,9 +63,30 @@ class Seq2SeqAttn(torch.nn.Module):
         self.attn = ConcatAttention(2 * enc_hidden_dim + dec_hidden_dim, hidden_dim=8)
         self.clf = torch.nn.Sequential(torch.nn.Linear(dec_hidden_dim, vocab_size_e),
                                        torch.nn.ReLU())
+        self._dec_hidden_dim = dec_hidden_dim
 
-    def forward(self):
-        pass
+    def forward(self,
+                encoder_inputs: torch.Tensor,
+                encoder_seq_length: torch.Tensor,
+                decoder_inputs: torch.Tensor,
+                decoder_seq_length: torch.Tensor) -> torch.Tensor:
+        """
+        Calculate output of decoder given input of both encoder & decoder.
+        :param encoder_inputs: torch.Tensor of shape [batch_size, max_len_enc]
+        :param encoder_seq_length: torch.Tensor of shape [batch_size]
+        :param decoder_inputs: torch.Tensor of shape [batch_size, max_len_dec]
+        :param decoder_seq_length: torch.Tensor of shape [batch_size]
+        :return:
+        """
+        decoder_inputs = decoder_inputs.transpose(0, 1)  # [max_seq_len_dec, batch_size]
+        batch_size = decoder_inputs.size(1)
+        decoder_state = torch.zeros([batch_size, self._dec_hidden_dim], device=decoder_inputs.device)
+        decoder_outputs = []
+        for decoder_cur_inputs in decoder_inputs:
+            dec_out, decoder_state = self.decode_one_step_forward(encoder_inputs, encoder_seq_length, decoder_cur_inputs, decoder_state)
+            decoder_outputs.append(dec_out)
+        decoder_outputs = torch.stack(decoder_outputs, dim=1)
+        return decoder_outputs
 
     def decode_one_step_forward(self,
                                 encoder_inputs: torch.Tensor,
@@ -87,4 +108,3 @@ class Seq2SeqAttn(torch.nn.Module):
         new_state = self.decoder(decoder_cur_inputs, decoder_state, context)
         out = self.clf(new_state)
         return out, new_state
-
