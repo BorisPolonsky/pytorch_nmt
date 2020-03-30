@@ -1,5 +1,7 @@
 import torch
 from models.seq2seq import Seq2SeqAttn
+from models.beam_search import top_k
+from functools import partial
 
 if __name__ == "__main__":
     device = None
@@ -15,5 +17,9 @@ if __name__ == "__main__":
                      dec_hidden_dim=dec_hidden_dim).to(device)
     init_dec_state = dec_state = torch.zeros([dec_cur_input.size(0), dec_hidden_dim], device=dec_cur_input.device)
     enc_outputs, _ = nn.encoder(enc_inputs, sequence_length)
+    decoder_fn = partial(nn.decode_one_step_forward, enc_outputs, sequence_length)
     for i in range(5):
-        out, dec_state = nn.decode_one_step_forward(enc_outputs, sequence_length, dec_cur_input, dec_state)
+        out, dec_state = decoder_fn(dec_cur_input, dec_state)
+        print(out.shape, dec_state.shape)
+    init_dec_input =torch.tensor([2, 2])
+    top_k(decoder_fn, 10, init_dec_input, init_dec_state, max_depth=20)
