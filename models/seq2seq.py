@@ -82,20 +82,22 @@ class Seq2SeqAttn(torch.nn.Module):
         batch_size = decoder_inputs.size(1)
         decoder_state = torch.zeros([batch_size, self._dec_hidden_dim], device=decoder_inputs.device)
         decoder_outputs = []
+        encoder_outputs, last_state = self.encoder(encoder_inputs, encoder_seq_length)
+
         for decoder_cur_inputs in decoder_inputs:
-            dec_out, decoder_state = self.decode_one_step_forward(encoder_inputs, encoder_seq_length, decoder_cur_inputs, decoder_state)
+            dec_out, decoder_state = self.decode_one_step_forward(encoder_outputs, encoder_seq_length, decoder_cur_inputs, decoder_state)
             decoder_outputs.append(dec_out)
         decoder_outputs = torch.stack(decoder_outputs, dim=1)
         return decoder_outputs
 
     def decode_one_step_forward(self,
-                                encoder_inputs: torch.Tensor,
+                                encoder_outputs: torch.Tensor,
                                 encoder_seq_length: torch.Tensor,
                                 decoder_cur_inputs: torch.Tensor,
                                 decoder_state: torch.Tensor) -> Tuple[torch.Tensor]:
         """
         Calculate logits for next word in target language & new state vectors of decoder.
-        :param encoder_inputs: torch.Tensor of shape [batch_size, max_seq_len]
+        :param encoder_outputs: torch.Tensor of shape [batch_size, max_seq_len, encoder_output_dim]
         :param encoder_seq_length: torch.Tensor of shape [batch_size]
         :param decoder_cur_inputs: torch.Tensor of shape [batch_size]
         :param decoder_state: torch.Tensor
@@ -103,8 +105,7 @@ class Seq2SeqAttn(torch.nn.Module):
                 - logits: torch.Tensor of shape [batch_size, vocab_size_e], logits for predicting next word.
                 - state: torch.Tensor of shape [batch_size, decoder_hidden_dim], updated state of decoder
         """
-        out, last_state = self.encoder(encoder_inputs, encoder_seq_length)
-        context, _ = self.attn(encoder_outputs=out, sequence_length=encoder_seq_length, decoder_state=decoder_state)
+        context, _ = self.attn(encoder_outputs=encoder_outputs, sequence_length=encoder_seq_length, decoder_state=decoder_state)
         new_state = self.decoder(decoder_cur_inputs, decoder_state, context)
         out = self.clf(new_state)
         return out, new_state
