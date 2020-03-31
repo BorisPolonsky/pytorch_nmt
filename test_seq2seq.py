@@ -1,6 +1,6 @@
 import torch
 from models.seq2seq import Seq2SeqAttn
-from models.beam_search import top_k
+from models.beam_search import beam_search
 from functools import partial
 
 if __name__ == "__main__":
@@ -20,6 +20,5 @@ if __name__ == "__main__":
     decoder_fn = partial(nn.decode_one_step_forward, enc_outputs, sequence_length)
     for i in range(5):
         out, dec_state = decoder_fn(dec_cur_input, dec_state)
-        print(out.shape, dec_state.shape)
-    init_dec_input =torch.tensor([2, 2])
-    top_k(decoder_fn, 10, init_dec_input, init_dec_state, max_depth=20)
+    init_dec_input = torch.tensor([2, 2])
+    nn.beam_search(enc_inputs, sequence_length, 10, init_dec_input, init_dec_state, max_length=20)
