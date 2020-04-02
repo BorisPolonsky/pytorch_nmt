@@ -141,6 +141,7 @@ class Seq2SeqAttn(torch.nn.Module):
         # logits: [batch_size, vocab_size], dec_state: [batch_size, decoder_state_dim]
         logits, dec_state = self.decode_one_step_forward(enc_outputs, sequence_length, dec_cur_input, dec_state)
         vocab_size = logits.size(-1)
+        assert max_length > 0
         assert eos_id < vocab_size
         acc_log_probs = F.log_softmax(logits, dim=-1)  # [batch_size, vocab_size]
         # acc_log_probs: [batch_size, n_beam], dec_cur_input: [batch_size, n_beam]
@@ -152,7 +153,10 @@ class Seq2SeqAttn(torch.nn.Module):
         dec_state = dec_state.unsqueeze(1).expand([-1, n_beam, -1]).flatten(start_dim=0, end_dim=1)  # [batch_size * n_beam, decoder_state_dim]
         dec_cur_input = dec_cur_input.flatten()  # [batch_size * n_beam]
         is_terminal = (dec_cur_input == eos_id)  # [batch_size * n_beam]
-        for i in torch.arange(max_length):
+        hypothesis_pool = torch.zeros([batch_size, n_beam, max_length + 1])
+        hypothesis_length = torch.zeros([batch_size * n_beam], device=is_terminal.device)
+        hypothesis_length.masked_fill_(is_terminal, 1)
+        for i in torch.arange(1, max_length):
             if torch.all(is_terminal):
                 break
             # logits: [batch_size * n_beam, vocab_size], dec_state: [batch_size * n_beam, decoder_dim]
@@ -185,9 +189,16 @@ class Seq2SeqAttn(torch.nn.Module):
             # get acc_log_probs
             acc_log_probs = acc_log_probs.reshape([batch_size, -1])  # [batch_size, n_beam * vocab_size], the very same organization as `scores`
             acc_log_probs = torch.gather(acc_log_probs, dim=-1, index=flattened_indices)
-            # Update is_terminal
+
+            # Update hypothesis_length & is_terminal
+            eos_flag = (vocab_ids_t == eos_id).flatten()
+            hypothesis_length = hypothesis_length.reshape([batch_size, n_beam]).gather(dim=1, index=branch_ind).flatten()
+            hypothesis_length.masked_fill_(eos_flag, i + 1)
+
             is_terminal = is_terminal.reshape([batch_size, n_beam]).gather(dim=1, index=branch_ind).flatten()
-            is_terminal = is_terminal | (vocab_ids_t == eos_id).flatten()
+            is_terminal = is_terminal | eos_flag
+            del eos_flag
+
             # log result
             back_pointers.append(branch_ind)
             vocab_ids.append(vocab_ids_t)
@@ -197,6 +208,7 @@ class Seq2SeqAttn(torch.nn.Module):
             dec_state = dec_state[indices, :]  # [batch_size * n_beam, decoder_state_dim]
             dec_cur_input = vocab_ids_t.flatten()  # [batch_size * n_beam]
             # TODO: Update hypothesis pool
+            ...
 
     def single_sequence_beam_search(self,
                                     encoder_inputs: torch.Tensor,
