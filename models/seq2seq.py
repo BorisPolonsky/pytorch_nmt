@@ -113,63 +113,90 @@ class Seq2SeqAttn(torch.nn.Module):
         out = self.clf(new_state)
         return out, new_state
 
-    def beam_search(self, encoder_inputs: torch.Tensor, sequence_length, n_beam, decoder_init_input: torch.Tensor,
-                    decoder_init_state: torch.Tensor, max_length=10):
+    def beam_search(self,
+                    encoder_inputs: torch.Tensor,
+                    sequence_length: torch.Tensor,
+                    n_beam: int,
+                    eos_id: int,
+                    decoder_init_input: torch.Tensor,
+                    decoder_init_state: torch.Tensor,
+                    max_length=10):
         """
         :param encoder_inputs: torch.Tensor of shape [batch_size, enc_max_length]
         :param sequence_length: torch.Tensor of shape [batch_size]. Lengths of sequence for encoder.
         :param n_beam: int
-        :param init_input: torch.Tensor
-        :param init_state: torch.Tensor
+        :param eos_id: int
+        :param decoder_init_input: torch.Tensor of shape [batch_size]
+        :param decoder_init_state: torch.Tensor of shape [batch_size, decoder_state_dim]
         :param max_length: maximum length of sentence (without [BOS] & [EOS]).
         :return:
         """
         back_pointers = []
         vocab_ids = []
         batch_size = decoder_init_input.size(0)
-        k_prev = 1
-        # k_prev: num of nodes in previous layer. In case of the first layer that contains
-        # [BOS] only, k_prev == 1
-        dec_cur_input = decoder_init_input  # [batch_size * k_prev(==1 for now)]
-        dec_state = decoder_init_state  # [batch_size * k_prev(==1 for now), decoder_dim]
-        enc_outputs, _ = self.encoder(encoder_inputs, sequence_length)  # [batch_size * k_prev(==1) for now,
+        dec_cur_input = decoder_init_input  # [batch_size]
+        dec_state = decoder_init_state  # [batch_size, decoder_state_dim]
+        enc_outputs, _ = self.encoder(encoder_inputs, sequence_length)  # [batch_size, encoder_max_seq_length, encoder_output_dim]
         acc_log_probs = torch.zeros([batch_size, 1])  # [batch_size, k_prev]
+        # logits: [batch_size, vocab_size], dec_state: [batch_size, decoder_state_dim]
+        logits, dec_state = self.decode_one_step_forward(enc_outputs, sequence_length, dec_cur_input, dec_state)
+        vocab_size = logits.size(-1)
+        assert eos_id < vocab_size
+        acc_log_probs = F.log_softmax(logits, dim=-1)  # [batch_size, vocab_size]
+        # acc_log_probs: [batch_size, n_beam], dec_cur_input: [batch_size, n_beam]
+        acc_log_probs, dec_cur_input = torch.topk(acc_log_probs, k=n_beam, dim=-1)
+        # expand batch: batch_size -> batch_size * n_beam
+        sequence_length = sequence_length.unsqueeze(1).expand([-1, n_beam]).flatten()  # [batch_size * n_beam)]
+        enc_outputs = enc_outputs.unsqueeze(1).expand([-1, n_beam, -1, -1])  # [batch_size, n_beam, encoder_max_seq_length, encoder_output_dim]
+        enc_outputs = enc_outputs.flatten(start_dim=0, end_dim=1)  # [batch_size * n_beam, encoder_max_seq_length, encoder_output_dim]
+        dec_state = dec_state.unsqueeze(1).expand([-1, n_beam, -1]).flatten(start_dim=0, end_dim=1)  # [batch_size * n_beam, decoder_state_dim]
+        dec_cur_input = dec_cur_input.flatten()  # [batch_size * n_beam]
+        is_terminal = (dec_cur_input == eos_id)  # [batch_size * n_beam]
         for i in torch.arange(max_length):
-            # logits: [batch_size * prev_k, vocab_size], dec_state: [batch_size * prev_k, decoder_dim]
+            if torch.all(is_terminal):
+                break
+            # logits: [batch_size * n_beam, vocab_size], dec_state: [batch_size * n_beam, decoder_dim]
             logits, dec_state = self.decode_one_step_forward(enc_outputs, sequence_length, dec_cur_input, dec_state)
-            vocab_size = logits.size(-1)
-            log_probs_t = F.log_softmax(logits, dim=-1)  # [batch_size * k_prev, vocab_size]
-            # [batch_size, k_prev, 1] + [batch_size, k_prev, vocab_size]
-            acc_log_probs = acc_log_probs.unsqueeze(-1) + log_probs_t.view(
-                [batch_size, -1, vocab_size])  # [batch_size, k_prev, vocab_size]
+
+            log_probs_t = F.log_softmax(logits, dim=-1)  # [batch_size * n_beam, vocab_size]
+            # [batch_size, k_prev, 1] + [batch_size, n_beam, vocab_size]
+            # calculate increment of acc_log_probs
+            increment = log_probs_t.reshape([batch_size, -1, vocab_size])  # [batch_size, n_beam, vocab_size]
+            increment_mask = is_terminal.reshape([batch_size, n_beam, 1]).expand_as(increment)
+            increment = torch.where(increment_mask, torch.zeros_like(increment), increment)
+            del increment_mask
+            acc_log_probs = acc_log_probs.unsqueeze(-1) + increment  # [batch_size, n_beam, vocab_size]
             # get top n_beam transitions
-            flattened_log_probs = acc_log_probs.view([batch_size, -1])  # [batch_size, k_prev * vocab_size]
-            # TODO: mask invalid probs (e.g. extended from "[..., "[EOS]"])
-            acc_log_probs, flattened_indices = torch.topk(flattened_log_probs, n_beam,
-                                                          dim=-1)  # [batch_size, n_beam], [batch_size, n_beam]
+            low_score = acc_log_probs.min() - 1
+            # For hypothesis that has ended, (e.g. [..., "[EOS]", ...]),
+            # we penalize all but one branches expanded from it before ranking.
+            penalty_mask = is_terminal.reshape([batch_size, n_beam, 1]).repeat([1, 1, vocab_size])  # don't use expand here
+            penalty_mask[:, :, 0] = False
+            scores = acc_log_probs.masked_fill(penalty_mask, low_score)  # [batch_size, n_beam, vocab_size]
+            del penalty_mask, low_score
+            scores = scores.view([batch_size, -1])  # [batch_size, n_beam * vocab_size]
+            _, flattened_indices = torch.topk(scores, n_beam, dim=-1)  # [batch_size, n_beam], [batch_size, n_beam]
             # Calculate quotient (prev_beam_ind) & remainder (current_vocab_id)
             # For this i_th sample in batch, j_th hypothesis in sample:
             # vocab_ids_t[i, j]: predicted word id
             # branch_ind[i, j]: index of branch this hypothesis is extended from
-            branch_ind = torch.div(flattened_indices, vocab_size)  # [batch_size, k_cur(==n_beam)]
-            vocab_ids_t = flattened_indices - branch_ind * vocab_size  # [batch_size, k_cur(==n_beam)]
+            branch_ind = torch.div(flattened_indices, vocab_size)  # [batch_size, n_beam]
+            vocab_ids_t = flattened_indices % vocab_size  # [batch_size, n_beam]
+            # get acc_log_probs
+            acc_log_probs = acc_log_probs.reshape([batch_size, -1])  # [batch_size, n_beam * vocab_size], the very same organization as `scores`
+            acc_log_probs = torch.gather(acc_log_probs, dim=-1, index=flattened_indices)
+            # Update is_terminal
+            is_terminal = is_terminal.reshape([batch_size, n_beam]).gather(dim=1, index=branch_ind).flatten()
+            is_terminal = is_terminal | (vocab_ids_t == eos_id).flatten()
             # log result
             back_pointers.append(branch_ind)
             vocab_ids.append(vocab_ids_t)
-            # Select inputs & states to be fed to decoder at the next time stamp
-            indices = ((torch.arange(batch_size) * k_prev).unsqueeze(
-                1) + branch_ind).flatten()  # [batch_size * k_cur(==n_beam)]
-            dec_state = dec_state[indices, :]
-            dec_cur_input = vocab_ids_t.flatten()  # [batch_size * k_cur, enc_max_length, ]
 
-            if i == 0:
-                # k_prev: 1 -> n_beam
-                k_prev = n_beam
-                sequence_length = sequence_length.unsqueeze(1).expand(
-                    [-1, k_prev]).flatten()  # [batch_size * k_prev(==n_beam)]
-                enc_outputs = enc_outputs.unsqueeze(1).expand([-1, k_prev, -1, -1]).reshape([-1, enc_outputs.size(-2),
-                                                                                             enc_outputs.size(
-                                                                                                 -1)])  # [batch_size * k_prev(==n_beam), enc_max_length, enc_output_dim]
+            # Select inputs & states to be fed to decoder at the next time stamp
+            indices = ((torch.arange(batch_size, device=branch_ind.device) * n_beam).unsqueeze(1) + branch_ind).flatten()  # [batch_size * n_beam]
+            dec_state = dec_state[indices, :]  # [batch_size * n_beam, decoder_state_dim]
+            dec_cur_input = vocab_ids_t.flatten()  # [batch_size * n_beam]
+            # TODO: Update hypothesis pool
 
     def single_sequence_beam_search(self,
                                     encoder_inputs: torch.Tensor,
