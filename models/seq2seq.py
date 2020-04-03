@@ -131,30 +131,32 @@ class Seq2SeqAttn(torch.nn.Module):
         :param max_length: maximum length of sentence (without [BOS] & [EOS]).
         :return:
         """
+        # TODO: case for max_length=1
         back_pointers = []
         vocab_ids = []
         batch_size = decoder_init_input.size(0)
         dec_cur_input = decoder_init_input  # [batch_size]
         dec_state = decoder_init_state  # [batch_size, decoder_state_dim]
         enc_outputs, _ = self.encoder(encoder_inputs, sequence_length)  # [batch_size, encoder_max_seq_length, encoder_output_dim]
-        acc_log_probs = torch.zeros([batch_size, 1])  # [batch_size, k_prev]
         # logits: [batch_size, vocab_size], dec_state: [batch_size, decoder_state_dim]
         logits, dec_state = self.decode_one_step_forward(enc_outputs, sequence_length, dec_cur_input, dec_state)
         vocab_size = logits.size(-1)
         assert max_length > 0
         assert eos_id < vocab_size
         acc_log_probs = F.log_softmax(logits, dim=-1)  # [batch_size, vocab_size]
-        # acc_log_probs: [batch_size, n_beam], dec_cur_input: [batch_size, n_beam]
-        acc_log_probs, dec_cur_input = torch.topk(acc_log_probs, k=n_beam, dim=-1)
+        # acc_log_probs: [batch_size, n_beam], vocab_ids_t: [batch_size, n_beam]
+        acc_log_probs, vocab_ids_t = torch.topk(acc_log_probs, k=n_beam, dim=-1)
+        # log
+        vocab_ids_t = vocab_ids_t.flatten()  # [batch_size * n_beam]
+        vocab_ids.append(vocab_ids_t)
         # expand batch: batch_size -> batch_size * n_beam
         sequence_length = sequence_length.unsqueeze(1).expand([-1, n_beam]).flatten()  # [batch_size * n_beam)]
         enc_outputs = enc_outputs.unsqueeze(1).expand([-1, n_beam, -1, -1])  # [batch_size, n_beam, encoder_max_seq_length, encoder_output_dim]
         enc_outputs = enc_outputs.flatten(start_dim=0, end_dim=1)  # [batch_size * n_beam, encoder_max_seq_length, encoder_output_dim]
         dec_state = dec_state.unsqueeze(1).expand([-1, n_beam, -1]).flatten(start_dim=0, end_dim=1)  # [batch_size * n_beam, decoder_state_dim]
-        dec_cur_input = dec_cur_input.flatten()  # [batch_size * n_beam]
+        dec_cur_input = vocab_ids_t.flatten()  # [batch_size * n_beam]
         is_terminal = (dec_cur_input == eos_id)  # [batch_size * n_beam]
-        hypothesis_pool = torch.zeros([batch_size, n_beam, max_length + 1])
-        hypothesis_length = torch.zeros([batch_size * n_beam], device=is_terminal.device)
+        hypothesis_length = torch.zeros([batch_size * n_beam], dtype=torch.int64, device=is_terminal.device)
         hypothesis_length.masked_fill_(is_terminal, 1)
         for i in torch.arange(1, max_length):
             if torch.all(is_terminal):
@@ -190,25 +192,36 @@ class Seq2SeqAttn(torch.nn.Module):
             acc_log_probs = acc_log_probs.reshape([batch_size, -1])  # [batch_size, n_beam * vocab_size], the very same organization as `scores`
             acc_log_probs = torch.gather(acc_log_probs, dim=-1, index=flattened_indices)
 
+            # log result
+            back_pointer = ((torch.arange(batch_size, device=branch_ind.device) * n_beam).unsqueeze(1) + branch_ind).flatten()  # [batch_size * n_beam]
+            back_pointers.append(back_pointer)
+            vocab_ids_t = vocab_ids_t.flatten()  # [batch_size * n_beam]
+            vocab_ids.append(vocab_ids_t)
+
             # Update hypothesis_length & is_terminal
-            eos_flag = (vocab_ids_t == eos_id).flatten()
-            hypothesis_length = hypothesis_length.reshape([batch_size, n_beam]).gather(dim=1, index=branch_ind).flatten()
+            eos_flag = (vocab_ids_t == eos_id)
+            hypothesis_length = hypothesis_length[back_pointer]
             hypothesis_length.masked_fill_(eos_flag, i + 1)
 
             is_terminal = is_terminal.reshape([batch_size, n_beam]).gather(dim=1, index=branch_ind).flatten()
             is_terminal = is_terminal | eos_flag
             del eos_flag
 
-            # log result
-            back_pointers.append(branch_ind)
-            vocab_ids.append(vocab_ids_t)
-
             # Select inputs & states to be fed to decoder at the next time stamp
-            indices = ((torch.arange(batch_size, device=branch_ind.device) * n_beam).unsqueeze(1) + branch_ind).flatten()  # [batch_size * n_beam]
-            dec_state = dec_state[indices, :]  # [batch_size * n_beam, decoder_state_dim]
-            dec_cur_input = vocab_ids_t.flatten()  # [batch_size * n_beam]
-            # TODO: Update hypothesis pool
-            ...
+            dec_state = dec_state[back_pointer, :]  # [batch_size * n_beam, decoder_state_dim]
+            dec_cur_input = vocab_ids_t  # [batch_size * n_beam]
+
+        vocab_ids = torch.stack(vocab_ids, dim=0)  # [decode_len, batch_size * n_beam]
+        back_pointers = torch.stack(back_pointers, dim=0)  # [decode_len - 1, batch_size, n_beam]
+
+        hypothesis_pool = torch.empty_like(vocab_ids)  # [decode_len, batch_size * n_beam]
+        hypothesis_pool[-1] = vocab_ids[-1]
+        for step in torch.arange(back_pointers.size(0)):
+            back_pointer = back_pointers[-1 - step]
+            hypothesis_pool[-2 - step] = vocab_ids[-2 - step][back_pointer]
+        hypothesis_pool.transpose_(0, 1)  # [batch_size * n_beam, decode_len]
+        hypothesis_pool = hypothesis_pool.reshape([batch_size, n_beam, -1])
+        return hypothesis_pool, hypothesis_length
 
     def single_sequence_beam_search(self,
                                     encoder_inputs: torch.Tensor,
