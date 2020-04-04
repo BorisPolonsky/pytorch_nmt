@@ -49,7 +49,6 @@ class Seq2SeqAttn(torch.nn.Module):
         :param embedding_dim_e:
         :param enc_hidden_dim:
         :param dec_hidden_dim:
-        :param attn:
         """
         super().__init__()
         enc_embd = torch.nn.Embedding(vocab_size_f, embedding_dim_f, padding_idx=0)
@@ -64,6 +63,7 @@ class Seq2SeqAttn(torch.nn.Module):
         self.attn = ConcatAttention(2 * enc_hidden_dim + dec_hidden_dim, hidden_dim=8)
         self.clf = torch.nn.Sequential(torch.nn.Linear(dec_hidden_dim, vocab_size_e),
                                        torch.nn.ReLU())
+        # TODO: Initialize bias of clf layer to penalize words that are not included in the training set.
         self._dec_hidden_dim = dec_hidden_dim
 
     def forward(self,
@@ -120,7 +120,7 @@ class Seq2SeqAttn(torch.nn.Module):
                     eos_id: int,
                     decoder_init_input: torch.Tensor,
                     decoder_init_state: torch.Tensor,
-                    max_length=10):
+                    max_length=10) -> Tuple[torch.Tensor]:
         """
         :param encoder_inputs: torch.Tensor of shape [batch_size, enc_max_length]
         :param sequence_length: torch.Tensor of shape [batch_size]. Lengths of sequence for encoder.
@@ -129,9 +129,12 @@ class Seq2SeqAttn(torch.nn.Module):
         :param decoder_init_input: torch.Tensor of shape [batch_size]
         :param decoder_init_state: torch.Tensor of shape [batch_size, decoder_state_dim]
         :param max_length: maximum length of sentence (without [BOS] & [EOS]).
-        :return:
+        :return: (hypothesis_pool, hypothesis_length)
+        hypothesis_pool: torch.Tensor of shape [batch_size, n_beam, max_length]
+        hypothesis_length: torch.Tensor of shape [batch_size, n_beam]
         """
-        # TODO: case for max_length=1
+        assert max_length > 0
+
         back_pointers = []
         vocab_ids = []
         batch_size = decoder_init_input.size(0)
@@ -141,11 +144,12 @@ class Seq2SeqAttn(torch.nn.Module):
         # logits: [batch_size, vocab_size], dec_state: [batch_size, decoder_state_dim]
         logits, dec_state = self.decode_one_step_forward(enc_outputs, sequence_length, dec_cur_input, dec_state)
         vocab_size = logits.size(-1)
-        assert max_length > 0
-        assert eos_id < vocab_size
+        assert 0 <= eos_id < vocab_size
         acc_log_probs = F.log_softmax(logits, dim=-1)  # [batch_size, vocab_size]
         # acc_log_probs: [batch_size, n_beam], vocab_ids_t: [batch_size, n_beam]
         acc_log_probs, vocab_ids_t = torch.topk(acc_log_probs, k=n_beam, dim=-1)
+        if max_length == 1:
+            return vocab_ids_t.unsqueeze(-1), torch.where(vocab_ids_t == eos_id, torch.ones_like(vocab_ids_t), torch.zeros_like(vocab_ids_t))
         # log
         vocab_ids_t = vocab_ids_t.flatten()  # [batch_size * n_beam]
         vocab_ids.append(vocab_ids_t)
@@ -221,6 +225,7 @@ class Seq2SeqAttn(torch.nn.Module):
             hypothesis_pool[-2 - step] = vocab_ids[-2 - step][back_pointer]
         hypothesis_pool.transpose_(0, 1)  # [batch_size * n_beam, decode_len]
         hypothesis_pool = hypothesis_pool.reshape([batch_size, n_beam, -1])
+        hypothesis_length = hypothesis_length.reshape([batch_size, n_beam])
         return hypothesis_pool, hypothesis_length
 
     def single_sequence_beam_search(self,
