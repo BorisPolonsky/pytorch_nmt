@@ -80,10 +80,10 @@ dec_hidden_dim = 200
 vocab_size_src = len(tokenizer_src.vocab)
 vocab_size_target = len(tokenizer_target.vocab)
 
-nn = Seq2SeqAttn(vocab_size_f=vocab_size_src,
-                 embedding_dim_f=embd_dim_src,
-                 vocab_size_e=vocab_size_target,
-                 embedding_dim_e=embd_dim_target,
+nn = Seq2SeqAttn(vocab_size_src=vocab_size_src,
+                 embedding_dim_src=embd_dim_src,
+                 vocab_size_target=vocab_size_target,
+                 embedding_dim_target=embd_dim_target,
                  enc_hidden_dim=enc_hidden_dim,
                  dec_hidden_dim=dec_hidden_dim).to(device)
 

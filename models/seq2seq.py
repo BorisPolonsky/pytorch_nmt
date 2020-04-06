@@ -39,29 +39,28 @@ class Decoder(torch.nn.Module):
 
 
 class Seq2SeqAttn(torch.nn.Module):
-    def __init__(self, vocab_size_f, embedding_dim_f, vocab_size_e, embedding_dim_e,
+    def __init__(self, vocab_size_src, embedding_dim_src, vocab_size_target, embedding_dim_target,
                  enc_hidden_dim, dec_hidden_dim):
         """
-        Terminology: We assume that the model translates a foreign language (f) to English (e)
-        :param vocab_size_f: Size of vocabulary of original language.
-        :param embedding_dim_f:
-        :param vocab_size_e: Size of vocabulary of target language.
-        :param embedding_dim_e:
+        :param vocab_size_src: Size of vocabulary of original language.
+        :param embedding_dim_src:
+        :param vocab_size_target: Size of vocabulary of target language.
+        :param embedding_dim_target:
         :param enc_hidden_dim:
         :param dec_hidden_dim:
         """
         super().__init__()
-        enc_embd = torch.nn.Embedding(vocab_size_f, embedding_dim_f, padding_idx=0)
-        enc_rnn = torch.nn.LSTM(input_size=embedding_dim_f, hidden_size=enc_hidden_dim, batch_first=True,
+        enc_embd = torch.nn.Embedding(vocab_size_src, embedding_dim_src, padding_idx=0)
+        enc_rnn = torch.nn.LSTM(input_size=embedding_dim_src, hidden_size=enc_hidden_dim, batch_first=True,
                                 bidirectional=True)
         self.encoder = Encoder(enc_embd, enc_rnn)
 
-        dec_embd = torch.nn.Embedding(vocab_size_e, embedding_dim_e, padding_idx=0)
-        dec_rnn_cell = torch.nn.GRUCell(input_size=2 * enc_hidden_dim + embedding_dim_e, hidden_size=dec_hidden_dim)
+        dec_embd = torch.nn.Embedding(vocab_size_target, embedding_dim_target, padding_idx=0)
+        dec_rnn_cell = torch.nn.GRUCell(input_size=2 * enc_hidden_dim + embedding_dim_target, hidden_size=dec_hidden_dim)
         self.decoder = Decoder(dec_embd, rnn_cell=dec_rnn_cell)
 
         self.attn = ConcatAttention(2 * enc_hidden_dim + dec_hidden_dim, hidden_dim=8)
-        self.clf = torch.nn.Sequential(torch.nn.Linear(dec_hidden_dim, vocab_size_e),
+        self.clf = torch.nn.Sequential(torch.nn.Linear(dec_hidden_dim, vocab_size_target),
                                        torch.nn.ReLU())
         # TODO: Initialize bias of clf layer to penalize words that are not included in the training set.
         self._dec_hidden_dim = dec_hidden_dim
