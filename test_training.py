@@ -23,7 +23,7 @@ def collate_fn(batch, device=None):
         token_ids_src.append(torch.tensor(record["token_ids_src"], dtype=torch.int64, device=device))
         token_ids_target.append(torch.tensor(record["token_ids_target"], dtype=torch.int64, device=device))
     seq_length_src = get_seq_length(token_ids_src)
-    seq_length_target = get_seq_length(token_ids_src)
+    seq_length_target = get_seq_length(token_ids_target)
     return {"token_ids_src": token_ids_src, "token_ids_target": token_ids_target,
             "seq_length_src": seq_length_src, "seq_length_target": seq_length_target}
 
