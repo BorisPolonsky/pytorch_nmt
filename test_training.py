@@ -66,8 +66,8 @@ def inspect_batch(tokenizer_src, tokenizer_target, enc_input, dec_input, dec_out
 
 def main(args):
     output_dir = args.output_dir
-    tokenizer_src = FullTokenizer("./data/vocab-eng.txt", do_lower_case=True)
-    tokenizer_target = FullTokenizer("./data/vocab-fra.txt", do_lower_case=True)
+    tokenizer_src = FullTokenizer("./data/eng-fra/vocab-eng.txt", do_lower_case=True)
+    tokenizer_target = FullTokenizer("./data/eng-fra/vocab-fra.txt", do_lower_case=True)
     training_set_cache = os.path.join(output_dir, "cache", "train.pkl")
 
     if os.path.exists(training_set_cache):
@@ -123,6 +123,13 @@ def main(args):
             # Right shift decoder output by one
             padded_outputs_dec = padded_inputs_dec[:, 1:]
             padded_inputs_dec = padded_inputs_dec[:, :-1]
+            # teacher_enforcing
+            seq_permute_rate = 0.2
+            token_permute_rate = 0.2
+            teacher_enforcing_mask = torch.rand(padded_inputs_dec.size(), device=padded_inputs_dec.device) >= token_permute_rate
+            teacher_enforcing_mask = (torch.rand([padded_inputs_dec.size(0), 1], device=padded_inputs_dec.device) >= seq_permute_rate) | teacher_enforcing_mask
+            permuted_inputs_dec = torch.randint_like(padded_inputs_dec, 0, vocab_size_target)
+            padded_inputs_dec = torch.where(teacher_enforcing_mask, padded_inputs_dec, permuted_inputs_dec)
             seq_length_enc = batch["seq_length_src"]
             seq_length_decoder = batch["seq_length_target"] - 1
             seq_length_decoder = torch.where(seq_length_decoder >= 0, seq_length_decoder, torch.zeros_like(seq_length_decoder))
