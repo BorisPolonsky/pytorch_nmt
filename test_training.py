@@ -2,8 +2,9 @@ from models.seq2seq import Seq2SeqAttn
 from tokenization import FullTokenizer
 import pandas as pd
 import torch
-from torch.utils.data import Dataset as PyTorchDataset
 from torch.utils.data import DataLoader
+from dataset.registry import registry
+from dataset.core import Dataset
 import os
 import functools
 from models.util import sequence_mask
@@ -26,22 +27,6 @@ def collate_fn(batch, device=None):
     seq_length_target = get_seq_length(token_ids_target)
     return {"token_ids_src": token_ids_src, "token_ids_target": token_ids_target,
             "seq_length_src": seq_length_src, "seq_length_target": seq_length_target}
-
-
-class PandasDataset(PyTorchDataset):
-    def __init__(self, df):
-        self.df = df
-
-    def __getitem__(self, index):
-        return {col: self.df.iloc[index, :][col] for col in self.df.columns}
-
-    def __len__(self):
-        return len(self.df)
-
-    def transform(self, transform_callable):
-        self.df = pd.DataFrame([transform_callable(record.to_dict()) for _, record in self.df.iterrows()],
-                               index=self.df.index)
-        return self
 
 
 def loss_fn(inputs, target, sequence_length):
@@ -69,13 +54,15 @@ def main(args):
     tokenizer_src = FullTokenizer("./data/eng-fra/vocab-eng.txt", do_lower_case=True)
     tokenizer_target = FullTokenizer("./data/eng-fra/vocab-fra.txt", do_lower_case=True)
     training_set_cache = os.path.join(output_dir, "cache", "train.pkl")
+    data_dir = "./data/eng-fra"
+    processor = registry.dataset["pytorch-seq2seq-tutorial"](data_dir=data_dir)
 
     if os.path.exists(training_set_cache):
         df = pd.read_pickle(training_set_cache)
+        training_set = Dataset(df)
     else:
-        raise NotImplementedError("WIP")
-
-    training_set = PandasDataset(df)
+        training_set = Dataset(processor.get_train_data())
+    print(training_set.df.head())
     if torch.cuda.is_available():
         device = torch.device("cuda:0")
     else:
