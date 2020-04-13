@@ -3,7 +3,7 @@ import pandas as pd
 
 
 class Dataset(PyTorchDataset):
-    def __init__(self, df):
+    def __init__(self, df: pd.DataFrame):
         self.df = df
 
     def __getitem__(self, index):
@@ -16,6 +16,13 @@ class Dataset(PyTorchDataset):
         self.df = pd.DataFrame([transform_callable(record.to_dict()) for _, record in self.df.iterrows()],
                                index=self.df.index)
         return self
+
+    def save(self, path):
+        self.df.to_pickle(path)
+
+    @classmethod
+    def load(cls, path):
+        return Dataset(df=pd.read_pickle(path))
 
 
 class Processor:

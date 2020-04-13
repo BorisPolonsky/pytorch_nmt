@@ -58,15 +58,15 @@ def main(args):
     processor = registry.dataset["pytorch-seq2seq-tutorial"](data_dir=data_dir)
 
     if os.path.exists(training_set_cache):
-        df = pd.read_pickle(training_set_cache)
-        training_set = Dataset(df)
+        training_set = Dataset.load(training_set_cache)
     else:
-        training_set = Dataset(processor.get_train_data())
+        training_set = processor.get_train_data()
     print(training_set.df.head())
     if torch.cuda.is_available():
         device = torch.device("cuda:0")
     else:
         device = torch.device("cpu")
+    exit(0)
     n_iter = 0
     embd_dim_src = 64
     embd_dim_target = 64
