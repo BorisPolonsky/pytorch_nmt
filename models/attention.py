@@ -46,6 +46,6 @@ class ConcatAttention(torch.nn.Module):
         attn_logits = self.fc_w(out)  # [batch_size, enc_seq_len, hidden_dim]
         attn_logits = attn_logits.tanh()
         attn_logits = self.fc_v(attn_logits).squeeze(2)  # [batch_size, enc_seqlen]
-        attn_weight = masked_softmax(attn_logits, sequence_length, mask_val=-50000).unsqueeze(1)  # [batch_size, 1, enc_seq_len]
-        out = torch.bmm(attn_weight, encoder_outputs).squeeze(1)
+        attn_weight = masked_softmax(attn_logits, sequence_length, mask_val=self.mask_val)  # [batch_size, enc_seq_len]
+        out = torch.bmm(attn_weight.unsqueeze(1), encoder_outputs).squeeze(1)
         return out, attn_weight
