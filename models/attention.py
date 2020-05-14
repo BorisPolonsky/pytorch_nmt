@@ -1,5 +1,6 @@
 import torch
 from .util import sequence_mask
+import math
 from typing import Tuple
 
 
@@ -45,7 +46,70 @@ class ConcatAttention(torch.nn.Module):
         out = torch.cat([encoder_outputs, decoder_state.unsqueeze(1).expand([-1, encoder_outputs.size(1), -1])], dim=-1)
         attn_logits = self.fc_w(out)  # [batch_size, enc_seq_len, hidden_dim]
         attn_logits = attn_logits.tanh()
-        attn_logits = self.fc_v(attn_logits).squeeze(2)  # [batch_size, enc_seqlen]
+        attn_logits = self.fc_v(attn_logits).squeeze(2)  # [batch_size, enc_seq_len]
         attn_weight = masked_softmax(attn_logits, sequence_length, mask_val=self.mask_val)  # [batch_size, enc_seq_len]
+        out = torch.bmm(attn_weight.unsqueeze(1), encoder_outputs).squeeze(1)
+        return out, attn_weight
+
+
+class BiLinearAttention(torch.nn.Module):
+    r"""
+    Calculate attention score as:
+    score(h_i, s_j) = h_{i}^{T}Ws_{j}
+    This type of attention mechanism is denoted as "general" in
+    [Effective Approaches to Attention-based Neural Machine Translation](https://www.aclweb.org/anthology/D15-1166/)
+    """
+    def __init__(self, encoder_state_dim, decoder_state_dim):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.Tensor(decoder_state_dim, encoder_state_dim))
+        self.mask_val = -50000
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        bound = 1 / math.sqrt(self.weight.size(0))
+        torch.nn.init.uniform_(self.weight, -bound, bound)
+
+    def forward(self, encoder_outputs: torch.Tensor, sequence_length: torch.Tensor, decoder_state: torch.Tensor) -> Tuple[torch.Tensor]:
+        """
+
+        :param encoder_outputs: torch.Tensor of shape [batch_size, enc_seq_len, enc_state_dim]
+        :param sequence_length: torch.Tensor of shape [batch_size]
+        :param decoder_state: torch.Tensor of shape [batch_size, dec_state_dim]
+        :return: tuple of (out, attn_weight)
+            - out: torch.Tensor of shape [batch_size, enc_seq_len, enc_state_dim], output with attention applied
+            - attn_weight: torch.Tensor of shape [batch_size, enc_sec_len], calculated attention weights.
+        """
+        h = encoder_outputs  # [batch_size, enc_seq_len, enc_state_dim]
+        s = decoder_state  # [batch_size, dec_state_dim]
+        Ws_ = torch.matmul(s, self.weight).unsqueeze(-1)  # [batch_size, enc_state_dim, 1]
+        attn_logits = torch.bmm(h, Ws_).squeeze(-1)  # [batch_size, enc_seq_len]
+        attn_weight = masked_softmax(attn_logits, sequence_length, mask_val=self.mask_val)  # [batch_size, enc_seq_len]
+        out = torch.bmm(attn_weight.unsqueeze(1), encoder_outputs).squeeze(1)
+        return out, attn_weight
+
+
+class DotAttention(torch.nn.Module):
+    r"""
+    Calculate attention score as:
+    score(h_i, s_j) = h_{i}^{T}s_{j}
+    """
+    def __init__(self, encoder_state_dim, decoder_state_dim):
+        super().__init__()
+        self.mask_val = -50000
+
+    def forward(self, encoder_outputs: torch.Tensor, sequence_length: torch.Tensor, decoder_state: torch.Tensor) -> Tuple[torch.Tensor]:
+        """
+
+        :param encoder_outputs: torch.Tensor of shape [batch_size, enc_seq_len, state_dim]
+        :param sequence_length: torch.Tensor of shape [batch_size]
+        :param decoder_state: torch.Tensor of shape [batch_size, state_dim]
+        :return: tuple of (out, attn_weight)
+            - out: torch.Tensor of shape [batch_size, enc_seq_len, state_dim], output with attention applied
+            - attn_weight: torch.Tensor of shape [batch_size, enc_sec_len], calculated attention weights.
+        """
+        h = encoder_outputs  # [batch_size, enc_seq_len, state_dim]
+        s = decoder_state.unsqueeze(-1)  # [batch_size, state_dim, 1]
+        attn_logits = torch.bmm(h, s).squeeze(-1)  # [batch_size, enc_seq_len]
+        attn_weight = masked_softmax(attn_logits, sequence_length, mask_val=self.mask_val) # [batch_size, enc_seq_len]
         out = torch.bmm(attn_weight.unsqueeze(1), encoder_outputs).squeeze(1)
         return out, attn_weight
