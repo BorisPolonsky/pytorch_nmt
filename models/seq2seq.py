@@ -34,7 +34,7 @@ class Decoder(torch.nn.Module):
         """
         out = self.embedding(inputs)  # [batch_size, embedding_dim]
         out = torch.cat([out, context], dim=1)
-        out = self.rnn_cell(out)
+        out = self.rnn_cell(out, state)
         return out
 
 
