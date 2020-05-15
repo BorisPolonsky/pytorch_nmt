@@ -66,7 +66,6 @@ def main(args):
         device = torch.device("cuda:0")
     else:
         device = torch.device("cpu")
-    exit(0)
     n_iter = 0
     embd_dim_src = 64
     embd_dim_target = 64
@@ -90,7 +89,8 @@ def main(args):
     print([name for name, param in nn.named_parameters()])
 
     model_dir = os.path.join(output_dir, "state_dict")
-
+    if not os.path.exists(model_dir):
+        os.makedirs(model_dir, exist_ok=False)
     writer = SummaryWriter(os.path.join(output_dir, "tensorboard"))
     num_epoch = 20
     batch_size = 64
@@ -127,7 +127,7 @@ def main(args):
             loss = loss_fn(logits, padded_outputs_dec, seq_length_decoder)
             loss.backward()
             writer.add_scalar("loss", loss, global_step=n_iter)
-            writer.add_scalar("lr", lr_scheduler.get_lr()[0], global_step=n_iter)
+            writer.add_scalar("lr", lr_scheduler.get_last_lr()[0], global_step=n_iter)
             optimizer.step()
         lr_scheduler.step()
 
