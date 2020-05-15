@@ -19,10 +19,16 @@ class Encoder(torch.nn.Module):
 
 
 class Decoder(torch.nn.Module):
-    def __init__(self, embedding, rnn_cell):
+    def __init__(self, embedding, rnn_cell, context_aggr_type="pre-concat"):
         super().__init__()
         self.embedding = embedding
         self.rnn_cell = rnn_cell
+        if context_aggr_type == "pre-concat":
+            self.forward_fn = self._pre_concat_forward_fn
+        elif context_aggr_type == "post-concat":
+            self.forward_fn = self._post_concat_forward_fn
+        else:
+            raise ValueError("Unrecognized value of parameter ``: {}".format(context_aggr_type))
 
     def forward(self, inputs: torch.Tensor, state: torch.Tensor, context: torch.Tensor):
         """
@@ -32,9 +38,34 @@ class Decoder(torch.nn.Module):
         :param context: torch.Tensor of shape [batch_size, context_dim]
         :return:
         """
+        return self.forward_fn(inputs, state, context)
+
+    def _pre_concat_forward_fn(self, inputs: torch.Tensor, state: torch.Tensor, context: torch.Tensor):
+        """
+        Aggregate context before rnn layer as defined in
+        Neural Machine Translation by Jointly Learning to Align and Translate
+        :param inputs: torch.Tensor of shape [batch_size]
+        :param state: torch.Tensor of shape [batch_size, state_dim]
+        :param context: torch.Tensor of shape [batch_size, context_dim]
+        :return:
+        """
         out = self.embedding(inputs)  # [batch_size, embedding_dim]
         out = torch.cat([out, context], dim=1)
         out = self.rnn_cell(out, state)
+        return out
+
+    def _post_concat_forward_fn(self, inputs: torch.Tensor, state: torch.Tensor, context: torch.Tensor):
+        """
+        Aggregate context after applying rnn layer as defined in
+        Get To The Point: Summarization with Pointer-Generator Networks
+        :param inputs: torch.Tensor of shape [batch_size]
+        :param state: torch.Tensor of shape [batch_size, state_dim]
+        :param context: torch.Tensor of shape [batch_size, context_dim]
+        :return:
+        """
+        out = self.embedding(inputs)  # [batch_size, embedding_dim]
+        out = self.rnn_cell(out, state)
+        out = torch.cat([out, context], dim=1)
         return out
 
 
