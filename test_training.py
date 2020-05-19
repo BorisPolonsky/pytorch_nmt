@@ -63,7 +63,7 @@ def main(args):
         training_set = processor.get_train_data()
     print(training_set.df.head())
     if torch.cuda.is_available():
-        device = torch.device("cuda:0")
+        device = torch.device("cuda")
     else:
         device = torch.device("cpu")
     n_iter = 0
@@ -73,14 +73,16 @@ def main(args):
     dec_hidden_dim = 200
     vocab_size_src = len(tokenizer_src.vocab)
     vocab_size_target = len(tokenizer_target.vocab)
-
+    use_multi_device = torch.cuda.device_count() > 1
     nn = Seq2SeqAttn(vocab_size_src=vocab_size_src,
                      embedding_dim_src=embd_dim_src,
                      vocab_size_target=vocab_size_target,
                      embedding_dim_target=embd_dim_target,
                      enc_hidden_dim=enc_hidden_dim,
-                     dec_hidden_dim=dec_hidden_dim).to(device)
-
+                     dec_hidden_dim=dec_hidden_dim)
+    if use_multi_device:
+        nn.encoder.flatten_parameters = True
+    nn = torch.nn.DataParallel(nn).to(device)
     lr = 0.1
     lr_decay = 0.99
     optimizer = torch.optim.SGD(nn.parameters(), lr=lr)
@@ -91,6 +93,7 @@ def main(args):
     model_dir = os.path.join(output_dir, "state_dict")
     if not os.path.exists(model_dir):
         os.makedirs(model_dir, exist_ok=False)
+
     writer = SummaryWriter(os.path.join(output_dir, "tensorboard"))
     num_epoch = 20
     batch_size = 64
@@ -132,10 +135,10 @@ def main(args):
         lr_scheduler.step()
 
         with open(os.path.join(model_dir, "model-{}.pkl".format(n_iter)), "wb") as f:
-            torch.save(nn.state_dict(), f)
+            torch.save(nn.module.state_dict(), f)
 
     with open(os.path.join(model_dir, "model-16984.pkl"), "rb") as f:
-        nn.load_state_dict(torch.load(f))
+        nn.module.load_state_dict(torch.load(f))
 
     test_set = training_set
     batch_size = 1
@@ -158,7 +161,7 @@ def main(args):
         seq_length_enc = batch["seq_length_src"]
         dec_init_state = torch.zeros([batch_size, dec_hidden_dim], device=device)
         decoder_init_input = torch.empty([batch_size], dtype=torch.int64, device=device).fill_(bos_id)
-        outputs, output_lengths = nn.beam_search(inputs_enc,
+        outputs, output_lengths = nn.module.beam_search(inputs_enc,
                                                  seq_length_enc,
                                                  n_beam=n_beam,
                                                  eos_id=eos_id,

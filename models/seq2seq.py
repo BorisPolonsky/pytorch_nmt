@@ -5,14 +5,17 @@ import torch.nn.functional as F
 
 
 class Encoder(torch.nn.Module):
-    def __init__(self, embedding, rnn):
+    def __init__(self, embedding, rnn, flatten_parameters=False):
         super().__init__()
         self.embedding = embedding
         self.rnn = rnn
+        self.flatten_parameters = flatten_parameters
 
     def forward(self, inputs: torch.Tensor, sequence_length: torch.Tensor):
         out = self.embedding(inputs)
         out = torch.nn.utils.rnn.pack_padded_sequence(out, sequence_length, batch_first=True, enforce_sorted=False)
+        if self.flatten_parameters:
+            self.rnn.flatten_parameters()
         out, last_state = self.rnn(out)
         out = torch.nn.utils.rnn.pad_packed_sequence(out, batch_first=True)[0]
         return out, last_state
