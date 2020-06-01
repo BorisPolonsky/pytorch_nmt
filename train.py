@@ -1,6 +1,5 @@
 from models.seq2seq import Seq2SeqAttn
 from tokenization import FullTokenizer
-import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 from dataset.registry import registry
@@ -11,6 +10,7 @@ from models.util import sequence_mask
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from argparse import ArgumentParser
+import json
 
 
 def collate_fn(batch, device=None):
@@ -49,46 +49,83 @@ def inspect_batch(tokenizer_src, tokenizer_target, enc_input, dec_input, dec_out
     print("dec_output", dec_output_tokens)
 
 
+def get_tokenizer(config):
+    """
+
+    :param config: {"tokenizer": "tokenizer-type", "args": {"key1": "value1"}}
+    :return: an object with method `tokenize`, `convert_tokens_to_ids` and `convert_ids_to_tokens`.
+    """
+    tokenizer_cls_name = config["tokenizer"]
+    tokenizer_cls = FullTokenizer  # no support for other tokenizers for now
+    kwargs = config.get("args", dict())
+    tokenizer = tokenizer_cls(**kwargs)
+    return tokenizer
+
+
+def apply_tokenization(dataset: Dataset, tokenizer_src, tokenizer_target):
+    def add_tokens_n_ids(df, tokenizer, group):
+        token_column = "tokens_{}".format(group)
+        token_id_column = "token_ids_{}".format(group)
+        if token_column not in df.columns:
+            df[token_column] = df["text_{}".format(group)].apply(tokenizer.tokenize)
+        if token_id_column not in df.columns:
+            df[token_id_column] = df[token_column].apply(tokenizer.convert_tokens_to_ids)
+    add_tokens_n_ids(dataset.df, tokenizer_src, "src")
+    add_tokens_n_ids(dataset.df, tokenizer_target, "target")
+
+
 def main(args):
     output_dir = args.output_dir
-    tokenizer_src = FullTokenizer("./data/eng-fra/vocab-eng.txt", do_lower_case=True)
-    tokenizer_target = FullTokenizer("./data/eng-fra/vocab-fra.txt", do_lower_case=True)
-    training_set_cache = os.path.join(output_dir, "cache", "train.pkl")
-    data_dir = "./data/eng-fra"
+    with open(args.config, "r", encoding="utf-8") as f:
+        config = json.load(f)
+    model_config = config["model"]
+    model_args = model_config.get("args", dict())
+    cache_dir = os.path.join(output_dir, "cache")
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir)
+    training_set_cache = os.path.join(cache_dir, "train.pkl")
+    data_dir = args.data_dir
     processor = registry.dataset["pytorch-seq2seq-tutorial"](data_dir=data_dir)
 
     if os.path.exists(training_set_cache):
         training_set = Dataset.load(training_set_cache)
     else:
         training_set = processor.get_train_data()
+
+    tokenization_config = config["tokenization"]
+    tokenizer_src = get_tokenizer(tokenization_config["source"])
+    tokenizer_target = get_tokenizer(
+        tokenization_config["target"]) if "target" in tokenization_config else tokenizer_src
+    apply_tokenization(training_set, tokenizer_src, tokenizer_target)
+    vocab_size_src = len(tokenizer_src.vocab)
+    vocab_size_target = len(tokenizer_target.vocab)
     print(training_set.df.head())
+    if not os.path.exists(training_set_cache):
+        training_set.save(training_set_cache)
     if torch.cuda.is_available():
         device = torch.device("cuda")
     else:
         device = torch.device("cpu")
     n_iter = 0
-    embd_dim_src = 64
-    embd_dim_target = 64
-    enc_hidden_dim = 100
-    dec_hidden_dim = 200
-    vocab_size_src = len(tokenizer_src.vocab)
-    vocab_size_target = len(tokenizer_target.vocab)
+
     use_multi_device = torch.cuda.device_count() > 1
-    nn = Seq2SeqAttn(vocab_size_src=vocab_size_src,
-                     embedding_dim_src=embd_dim_src,
-                     vocab_size_target=vocab_size_target,
-                     embedding_dim_target=embd_dim_target,
-                     enc_hidden_dim=enc_hidden_dim,
-                     dec_hidden_dim=dec_hidden_dim)
+    nn = Seq2SeqAttn(**model_args)
     if use_multi_device:
         nn.encoder.flatten_parameters = True
-    nn = torch.nn.DataParallel(nn).to(device)
-    lr = 0.1
-    lr_decay = 0.99
-    optimizer = torch.optim.SGD(nn.parameters(), lr=lr)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, gamma=lr_decay)
+        wrapped_nn = torch.nn.DataParallel(nn).to(device)
+        nn = wrapped_nn.module  # Just in case
+    else:
+        wrapped_nn = nn = nn.to(device)
 
     print([name for name, param in nn.named_parameters()])
+
+    optimizer_config = config["optimizer"]
+    optimizer_cls = torch.optim.SGD  # No support for other optimizers for now
+    optimizer_args = optimizer_config.get("args", dict())
+    optimizer = optimizer_cls(wrapped_nn.parameters(), **optimizer_args)
+
+    lr_decay = config["lr_schedule"]["decay"]
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, gamma=lr_decay)
 
     model_dir = os.path.join(output_dir, "state_dict")
     if not os.path.exists(model_dir):
@@ -116,17 +153,20 @@ def main(args):
             # teacher_enforcing
             seq_permute_rate = 0.2
             token_permute_rate = 0.2
-            teacher_enforcing_mask = torch.rand(padded_inputs_dec.size(), device=padded_inputs_dec.device) >= token_permute_rate
-            teacher_enforcing_mask = (torch.rand([padded_inputs_dec.size(0), 1], device=padded_inputs_dec.device) >= seq_permute_rate) | teacher_enforcing_mask
+            teacher_enforcing_mask = torch.rand(padded_inputs_dec.size(),
+                                                device=padded_inputs_dec.device) >= token_permute_rate
+            teacher_enforcing_mask = (torch.rand([padded_inputs_dec.size(0), 1],
+                                                 device=padded_inputs_dec.device) >= seq_permute_rate) | teacher_enforcing_mask
             permuted_inputs_dec = torch.randint_like(padded_inputs_dec, 0, vocab_size_target)
             padded_inputs_dec = torch.where(teacher_enforcing_mask, padded_inputs_dec, permuted_inputs_dec)
             seq_length_enc = batch["seq_length_src"]
             seq_length_decoder = batch["seq_length_target"] - 1
-            seq_length_decoder = torch.where(seq_length_decoder >= 0, seq_length_decoder, torch.zeros_like(seq_length_decoder))
+            seq_length_decoder = torch.where(seq_length_decoder >= 0, seq_length_decoder,
+                                             torch.zeros_like(seq_length_decoder))
 
             # inspect_batch(tokenizer_src, tokenizer_target, padded_inputs_enc, padded_inputs_dec, padded_outputs_dec)
             optimizer.zero_grad()
-            logits = nn(padded_inputs_enc, seq_length_enc, padded_inputs_dec, seq_length_decoder)
+            logits = wrapped_nn(padded_inputs_enc, seq_length_enc, padded_inputs_dec, seq_length_decoder)
             loss = loss_fn(logits, padded_outputs_dec, seq_length_decoder)
             loss.backward()
             writer.add_scalar("loss", loss, global_step=n_iter)
@@ -153,7 +193,8 @@ def main(args):
                             batch_size=batch_size,
                             collate_fn=functools.partial(collate_fn, device=device)):
         n_iter += 1
-        tokens_target = [tokenizer_target.convert_ids_to_tokens(item.cpu().numpy()) for item in batch["token_ids_target"]]
+        tokens_target = [tokenizer_target.convert_ids_to_tokens(item.cpu().numpy()) for item in
+                         batch["token_ids_target"]]
 
         inputs_enc = torch.nn.utils.rnn.pad_sequence(batch["token_ids_src"],
                                                      batch_first=True,
@@ -162,12 +203,12 @@ def main(args):
         dec_init_state = torch.zeros([batch_size, dec_hidden_dim], device=device)
         decoder_init_input = torch.empty([batch_size], dtype=torch.int64, device=device).fill_(bos_id)
         outputs, output_lengths = nn.module.beam_search(inputs_enc,
-                                                 seq_length_enc,
-                                                 n_beam=n_beam,
-                                                 eos_id=eos_id,
-                                                 decoder_init_input=decoder_init_input,
-                                                 decoder_init_state=dec_init_state,
-                                                 max_length=max_output_length)
+                                                        seq_length_enc,
+                                                        n_beam=n_beam,
+                                                        eos_id=eos_id,
+                                                        decoder_init_input=decoder_init_input,
+                                                        decoder_init_state=dec_init_state,
+                                                        max_length=max_output_length)
         print(outputs, output_lengths)
         for pred, ref in zip(outputs, tokens_target):
             print("Reference:", ref)
@@ -178,7 +219,11 @@ def main(args):
 
 def _get_parser():
     parser = ArgumentParser()
-    parser.add_argument("--output-dir", type=os.path.normpath, help="Directory for storing serilized dataset, model, evaluation results e.t.c..")
+    parser.add_argument("--output-dir", type=os.path.normpath,
+                        help="Directory for storing serialized dataset, model, evaluation results e.t.c..")
+    parser.add_argument("--config", type=os.path.normpath,
+                        help="Model specification file in JSON format.")
+    parser.add_argument("--data-dir", type=os.path.normpath, help="Directory for dataset.")
     return parser
 
 
