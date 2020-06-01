@@ -48,8 +48,8 @@ class EngFraDataProcessor(Processor):
                 special_tokens.append("[unused{}]".format(len(special_tokens) + 1))
             return special_tokens + vocab
 
-        def convert_tokens2ids(tokens, token2id, oov="[UNK]"):
-            token_ids = [token2id.get(token, oov) for token in tokens]
+        def convert_tokens2ids(tokens, token2id, oov_id):
+            token_ids = [token2id.get(token, oov_id) for token in tokens]
             return token_ids
 
         print("Building data set.")
@@ -69,13 +69,12 @@ class EngFraDataProcessor(Processor):
         token2id_french = {token: i for i, token in enumerate(vocab_french)}
 
         # Determine src and target language
-        src_text, src_tokens, src_token2id = text_english, tokens_english,  token2id_english
-        target_text, target_tokens, target_token2id = text_french, tokens_french, token2id_french
+        src_text, src_tokens, src_token2id, src_oov_id = text_english, tokens_english,  token2id_english, token2id_english["[UNK]"]
+        target_text, target_tokens, target_token2id, target_oov_id = text_french, tokens_french, token2id_french, token2id_french["[UNK]"]
 
-        src_token_ids = src_tokens.apply(lambda x: convert_tokens2ids(x, src_token2id))
+        src_token_ids = src_tokens.apply(lambda x: convert_tokens2ids(x, src_token2id, src_oov_id))
         target_tokens = target_tokens.apply(lambda x: ["[BOS]"] + x + ["[EOS]"])
-        target_token_ids = target_tokens.apply(lambda x: convert_tokens2ids(x, target_token2id))
-
+        target_token_ids = target_tokens.apply(lambda x: convert_tokens2ids(x, target_token2id, target_oov_id))
         df = pd.DataFrame({"text_src": src_text,
                            "text_target": target_text,
                            "tokens_src": src_tokens,
@@ -83,3 +82,4 @@ class EngFraDataProcessor(Processor):
                            "token_ids_src": src_token_ids,
                            "token_ids_target": target_token_ids})
         self.df_all = df
+        print("Build complete: vocab_size_src: {}, vocab_size_target: {}".format(len(src_token2id), len(target_token2id)))
