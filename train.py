@@ -11,6 +11,45 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from argparse import ArgumentParser
 import json
+import itertools
+from parallel import DataParallelCriterion
+
+
+class DataParallel(torch.nn.DataParallel):
+    """
+    Dropped final gathering op, return results as is from its
+    corresponding devices
+    """
+
+    def forward(self, *inputs, **kwargs):
+        if not self.device_ids:
+            return self.module(*inputs, **kwargs)
+
+        for t in itertools.chain(self.module.parameters(), self.module.buffers()):
+            if t.device != self.src_device_obj:
+                raise RuntimeError("module must have its parameters and buffers "
+                                   "on device {} (device_ids[0]) but found one of "
+                                   "them on device: {}".format(self.src_device_obj, t.device))
+
+        inputs, kwargs = self.scatter(inputs, kwargs, self.device_ids)
+        if len(self.device_ids) == 1:
+            return self.module(*inputs[0], **kwargs[0])
+        replicas = self.replicate(self.module, self.device_ids[:len(inputs)])
+        outputs = self.parallel_apply(replicas, inputs, kwargs)
+        # return self.gather(outputs, self.output_device)
+        return outputs
+
+
+class MaskedCrossEntropyLoss(torch.nn.Module):
+    def forward(self, inputs, target, sequence_length):
+        max_len = inputs.size(1)
+        inputs = inputs.transpose(1, 2)  # [batch_size, n_cls, seq_len]
+        loss = F.cross_entropy(inputs, target, reduction="none")  # [batch_size, seq_len]
+
+        mask = sequence_mask(sequence_length, maxlen=max_len).to(loss.device)
+        loss = torch.where(mask, loss, torch.zeros_like(loss))
+        loss = loss.sum()
+        return loss
 
 
 def collate_fn(batch, device=None):
@@ -27,17 +66,6 @@ def collate_fn(batch, device=None):
     seq_length_target = get_seq_length(token_ids_target)
     return {"token_ids_src": token_ids_src, "token_ids_target": token_ids_target,
             "seq_length_src": seq_length_src, "seq_length_target": seq_length_target}
-
-
-def loss_fn(inputs, target, sequence_length):
-    max_len = inputs.size(1)
-    inputs = inputs.transpose(1, 2)  # [batch_size, n_cls, seq_len]
-    loss = F.cross_entropy(inputs, target, reduction="none")  # [batch_size, seq_len]
-
-    mask = sequence_mask(sequence_length, maxlen=max_len).to(loss.device)
-    loss = torch.where(mask, loss, torch.zeros_like(loss))
-    loss = loss.sum() / sequence_length.sum()
-    return loss
 
 
 def inspect_batch(tokenizer_src, tokenizer_target, enc_input, dec_input, dec_output):
@@ -108,12 +136,14 @@ def main(args):
         device = torch.device("cpu")
     n_iter = 0
 
-    use_multi_device = torch.cuda.device_count() > 1
+    use_multi_device = True  # torch.cuda.device_count() > 1
     nn = Seq2SeqAttn(**model_args)
+    loss_fn = MaskedCrossEntropyLoss()
     if use_multi_device:
         nn.encoder.flatten_parameters = True
-        wrapped_nn = torch.nn.DataParallel(nn).to(device)
+        wrapped_nn = DataParallel(nn).to(device)
         nn = wrapped_nn.module  # Just in case
+        loss_fn = DataParallelCriterion(loss_fn)
     else:
         wrapped_nn = nn = nn.to(device)
 
@@ -166,9 +196,16 @@ def main(args):
 
             # inspect_batch(tokenizer_src, tokenizer_target, padded_inputs_enc, padded_inputs_dec, padded_outputs_dec)
             optimizer.zero_grad()
-            logits = wrapped_nn(padded_inputs_enc, seq_length_enc, padded_inputs_dec, seq_length_decoder)
-            loss = loss_fn(logits, padded_outputs_dec, seq_length_decoder)
-            loss.backward()
+            if not use_multi_device:
+                logits = wrapped_nn(padded_inputs_enc, seq_length_enc, padded_inputs_dec, seq_length_decoder)
+                loss = loss_fn(logits, padded_outputs_dec, seq_length_decoder)
+                loss = loss / seq_length_enc.sum()
+                loss.backward()
+            else:
+                logits = wrapped_nn(padded_inputs_enc, seq_length_enc, padded_inputs_dec, seq_length_decoder)
+                loss = loss_fn(logits, padded_outputs_dec, seq_length_decoder)  # [n_devices]
+                loss = loss.sum() / seq_length_enc.sum()
+                loss.backward()
             writer.add_scalar("loss", loss, global_step=n_iter)
             writer.add_scalar("lr", lr_scheduler.get_last_lr()[0], global_step=n_iter)
             optimizer.step()
