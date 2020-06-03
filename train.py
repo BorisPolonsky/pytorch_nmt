@@ -136,7 +136,7 @@ def main(args):
         device = torch.device("cpu")
     n_iter = 0
 
-    use_multi_device = True  # torch.cuda.device_count() > 1
+    use_multi_device = torch.cuda.device_count() > 1
     nn = Seq2SeqAttn(**model_args)
     loss_fn = MaskedCrossEntropyLoss()
     if use_multi_device:
@@ -212,10 +212,10 @@ def main(args):
         lr_scheduler.step()
 
         with open(os.path.join(model_dir, "model-{}.pkl".format(n_iter)), "wb") as f:
-            torch.save(nn.module.state_dict(), f)
+            torch.save(nn.state_dict(), f)
 
     with open(os.path.join(model_dir, "model-16984.pkl"), "rb") as f:
-        nn.module.load_state_dict(torch.load(f))
+        nn.load_state_dict(torch.load(f))
 
     test_set = training_set
     batch_size = 1
