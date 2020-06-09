@@ -238,11 +238,12 @@ class Seq2SeqAttn(torch.nn.Module):
             # Update hypothesis_length & is_terminal
             eos_flag = (vocab_ids_t == eos_id)
             hypothesis_length = hypothesis_length[back_pointer]
-            hypothesis_length.masked_fill_(eos_flag, i + 1)
+            length_update_flag = (eos_flag & (~is_terminal))  # In case [EOS] appears twice
+            hypothesis_length.masked_fill_(length_update_flag, i + 1)
 
             is_terminal = is_terminal.reshape([batch_size, n_beam]).gather(dim=1, index=branch_ind).flatten()
             is_terminal = is_terminal | eos_flag
-            del eos_flag
+            del eos_flag, length_update_flag
 
             # Select inputs & states to be fed to decoder at the next time stamp
             dec_state = dec_state[back_pointer, :]  # [batch_size * n_beam, decoder_state_dim]
