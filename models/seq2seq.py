@@ -257,7 +257,10 @@ class Seq2SeqAttn(torch.nn.Module):
         hypothesis_pool[-1] = vocab_ids[-1]
         for step in torch.arange(back_pointers.size(0)):
             back_pointer = back_pointers[-1 - step]
+            if step > 0:
+                back_pointer = back_pointer[prev_back_pointer]
             hypothesis_pool[-2 - step] = vocab_ids[-2 - step][back_pointer]
+            prev_back_pointer = back_pointer
         hypothesis_pool.transpose_(0, 1)  # [batch_size * n_beam, decode_len]
         hypothesis_pool = hypothesis_pool.reshape([batch_size, n_beam, -1])
         hypothesis_length = hypothesis_length.reshape([batch_size, n_beam])
