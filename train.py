@@ -13,7 +13,8 @@ from argparse import ArgumentParser
 import json
 import itertools
 from parallel import DataParallelCriterion
-
+import re
+import glob
 
 class DataParallel(torch.nn.DataParallel):
     """
@@ -116,6 +117,9 @@ def apply_tokenization(dataset: Dataset, tokenizer_src, tokenizer_target):
     add_tokens_n_ids(dataset.df, tokenizer_src, "src")
     add_tokens_n_ids(dataset.df, tokenizer_target, "target")
 
+def get_last_checkpoint(checkpoint_dir: str):
+    avaliable_checkpoint_indices =  [int(re.search("model-([0-9]*).pt$", path)) for path in glob.iglob(os.path.join(checkpoint_dir, "model-*pt"))]
+    return os.path.join(checkpoint_dir, "model-{}.pt".format(max(avaliable_checkpoint_indices)))
 
 def main(args):
     output_dir = args.output_dir
@@ -229,10 +233,12 @@ def main(args):
             optimizer.step()
         lr_scheduler.step()
 
-        with open(os.path.join(model_dir, "model-{}.pkl".format(n_iter)), "wb") as f:
+        with open(os.path.join(model_dir, "model-{}.pt".format(n_iter)), "wb") as f:
             torch.save(nn.state_dict(), f)
 
-    with open(os.path.join(model_dir, "model-1911.pkl"), "rb") as f:
+    last_checkpoint = get_last_checkpoint(model_dir)
+    print("Loading checkpoint from {}".format(last_checkpoint))
+    with open(last_checkpoint, "rb") as f:
         nn.load_state_dict(torch.load(f))
 
     test_set_cache = os.path.join(cache_dir, "test.pkl")

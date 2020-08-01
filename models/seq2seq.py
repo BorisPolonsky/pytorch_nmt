@@ -223,7 +223,7 @@ class Seq2SeqAttn(torch.nn.Module):
             # For this i_th sample in batch, j_th hypothesis in sample:
             # vocab_ids_t[i, j]: predicted word id
             # branch_ind[i, j]: index of branch this hypothesis is extended from
-            branch_ind = torch.div(flattened_indices, vocab_size)  # [batch_size, n_beam]
+            branch_ind = torch.floor_divide(flattened_indices, vocab_size)  # [batch_size, n_beam]
             vocab_ids_t = flattened_indices % vocab_size  # [batch_size, n_beam]
             # get acc_log_probs
             acc_log_probs = acc_log_probs.reshape([batch_size, -1])  # [batch_size, n_beam * vocab_size], the very same organization as `scores`
