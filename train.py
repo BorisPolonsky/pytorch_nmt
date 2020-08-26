@@ -16,6 +16,7 @@ from parallel import DataParallelCriterion
 import re
 import glob
 
+
 class DataParallel(torch.nn.DataParallel):
     """
     Dropped final gathering op, return results as is from its
@@ -117,9 +118,13 @@ def apply_tokenization(dataset: Dataset, tokenizer_src, tokenizer_target):
     add_tokens_n_ids(dataset.df, tokenizer_src, "src")
     add_tokens_n_ids(dataset.df, tokenizer_target, "target")
 
+
 def get_last_checkpoint(checkpoint_dir: str):
-    avaliable_checkpoint_indices =  [int(re.search("model-([0-9]*).pt$", path)) for path in glob.iglob(os.path.join(checkpoint_dir, "model-*pt"))]
-    return os.path.join(checkpoint_dir, "model-{}.pt".format(max(avaliable_checkpoint_indices)))
+    available_checkpoint_indices = [int(re.search("model-([0-9]*).pt$", path).group(1)) for path in glob.iglob(os.path.join(checkpoint_dir, "model-*pt"))]
+    if not available_checkpoint_indices:
+        raise ValueError("No state_dict found in ".format(checkpoint_dir))
+    return os.path.join(checkpoint_dir, "model-{}.pt".format(max(available_checkpoint_indices)))
+
 
 def main(args):
     output_dir = args.output_dir
@@ -171,125 +176,125 @@ def main(args):
     model_dir = os.path.join(output_dir, "state_dict")
     if not os.path.exists(model_dir):
         os.makedirs(model_dir, exist_ok=False)
+    if args.do_train:
+        print("Preparing training data.")
+        training_set_cache = os.path.join(cache_dir, "train.pkl")
+        if os.path.exists(training_set_cache):
+            training_set = Dataset.load(training_set_cache)
+        else:
+            training_set = processor.get_train_data()
+            training_set.save(training_set_cache)
+        apply_tokenization(training_set, tokenizer_src, tokenizer_target)
+        print(training_set.df.head())
 
+        writer = SummaryWriter(os.path.join(output_dir, "tensorboard"))
+        num_epoch = 20
+        batch_size = 64
+        for epoch_i in range(num_epoch):
+            print("Epoch {}".format(epoch_i))
+            for batch in DataLoader(training_set,
+                                    shuffle=True,
+                                    batch_size=batch_size,
+                                    collate_fn=functools.partial(collate_fn, device=device)):
+                n_iter += 1
+                padded_inputs_enc = torch.nn.utils.rnn.pad_sequence(batch["token_ids_src"],
+                                                                    batch_first=True,
+                                                                    padding_value=0)
+                padded_inputs_dec = torch.nn.utils.rnn.pad_sequence(batch["token_ids_target"],
+                                                                    batch_first=True,
+                                                                    padding_value=0)
+                # Right shift decoder output by one
+                padded_outputs_dec = padded_inputs_dec[:, 1:]
+                padded_inputs_dec = padded_inputs_dec[:, :-1]
+                # teacher_enforcing
+                seq_permute_rate = 0.2
+                token_permute_rate = 0.2
+                teacher_enforcing_mask = torch.rand(padded_inputs_dec.size(),
+                                                    device=padded_inputs_dec.device) >= token_permute_rate
+                teacher_enforcing_mask = (torch.rand([padded_inputs_dec.size(0), 1],
+                                                     device=padded_inputs_dec.device) >= seq_permute_rate) | teacher_enforcing_mask
+                permuted_inputs_dec = torch.randint_like(padded_inputs_dec, 0, vocab_size_target)
+                padded_inputs_dec = torch.where(teacher_enforcing_mask, padded_inputs_dec, permuted_inputs_dec)
+                seq_length_enc = batch["seq_length_src"]
+                seq_length_decoder = batch["seq_length_target"] - 1
+                seq_length_decoder = torch.where(seq_length_decoder >= 0, seq_length_decoder,
+                                                 torch.zeros_like(seq_length_decoder))
 
-    print("Preparing training data.")
-    training_set_cache = os.path.join(cache_dir, "train.pkl")
-    if os.path.exists(training_set_cache):
-        training_set = Dataset.load(training_set_cache)
-    else:
-        training_set = processor.get_train_data()
-        training_set.save(training_set_cache)
-    apply_tokenization(training_set, tokenizer_src, tokenizer_target)
-    print(training_set.df.head())
+                # inspect_batch(tokenizer_src, tokenizer_target, padded_inputs_enc, padded_inputs_dec, padded_outputs_dec)
+                optimizer.zero_grad()
+                if not use_multi_device:
+                    logits = wrapped_nn(padded_inputs_enc, seq_length_enc, padded_inputs_dec, seq_length_decoder)
+                    loss = loss_fn(logits, padded_outputs_dec, seq_length_decoder)
+                    loss = loss / seq_length_enc.sum()
+                    loss.backward()
+                else:
+                    logits = wrapped_nn(padded_inputs_enc, seq_length_enc, padded_inputs_dec, seq_length_decoder)
+                    loss = loss_fn(logits, padded_outputs_dec, seq_length_decoder)  # [n_devices]
+                    loss = loss.sum() / seq_length_enc.sum()
+                    loss.backward()
+                writer.add_scalar("loss", loss, global_step=n_iter)
+                writer.add_scalar("lr", lr_scheduler.get_last_lr()[0], global_step=n_iter)
+                optimizer.step()
+            lr_scheduler.step()
 
-    writer = SummaryWriter(os.path.join(output_dir, "tensorboard"))
-    num_epoch = 20
-    batch_size = 64
-    for epoch_i in range(num_epoch):
-        print("Epoch {}".format(epoch_i))
-        for batch in DataLoader(training_set,
-                                shuffle=True,
+            with open(os.path.join(model_dir, "model-{}.pt".format(n_iter)), "wb") as f:
+                torch.save(nn.state_dict(), f)
+
+    if args.do_predict:
+        last_checkpoint = get_last_checkpoint(model_dir)
+        print("Loading checkpoint from {}".format(last_checkpoint))
+        with open(last_checkpoint, "rb") as f:
+            nn.load_state_dict(torch.load(f))
+
+        test_set_cache = os.path.join(cache_dir, "test.pkl")
+        if os.path.exists(test_set_cache):
+            test_set = Dataset.load(test_set_cache)
+        else:
+            test_set = processor.get_test_data()
+            test_set.save(test_set_cache)
+
+        batch_size = 10
+        bos_id = tokenizer_target.convert_tokens_to_ids(["[BOS]"])[0]
+        eos_id = tokenizer_target.convert_tokens_to_ids(["[EOS]"])[0]
+        n_beam = 10
+        dec_hidden_dim = nn.decoder.rnn_cell.weight_hh.size(1)
+        max_output_length = 100
+        print("bos_id: {}, eos_id: {}".format(bos_id, eos_id))
+
+        for batch in DataLoader(test_set,
+                                shuffle=False,
                                 batch_size=batch_size,
                                 collate_fn=functools.partial(collate_fn, device=device)):
-            n_iter += 1
-            padded_inputs_enc = torch.nn.utils.rnn.pad_sequence(batch["token_ids_src"],
-                                                                batch_first=True,
-                                                                padding_value=0)
-            padded_inputs_dec = torch.nn.utils.rnn.pad_sequence(batch["token_ids_target"],
-                                                                batch_first=True,
-                                                                padding_value=0)
-            # Right shift decoder output by one
-            padded_outputs_dec = padded_inputs_dec[:, 1:]
-            padded_inputs_dec = padded_inputs_dec[:, :-1]
-            # teacher_enforcing
-            seq_permute_rate = 0.2
-            token_permute_rate = 0.2
-            teacher_enforcing_mask = torch.rand(padded_inputs_dec.size(),
-                                                device=padded_inputs_dec.device) >= token_permute_rate
-            teacher_enforcing_mask = (torch.rand([padded_inputs_dec.size(0), 1],
-                                                 device=padded_inputs_dec.device) >= seq_permute_rate) | teacher_enforcing_mask
-            permuted_inputs_dec = torch.randint_like(padded_inputs_dec, 0, vocab_size_target)
-            padded_inputs_dec = torch.where(teacher_enforcing_mask, padded_inputs_dec, permuted_inputs_dec)
+            tokens_src = batch["tokens_src"] if "tokens_src" in batch else [
+                tokenizer_src.convert_ids_to_tokens(item.cpu().numpy()) for item in
+                batch["token_ids_src"]]
+            tokens_target = batch["tokens_target"] if "tokens_target" in batch else [
+                tokenizer_target.convert_ids_to_tokens(item.cpu().numpy()) for item in
+                batch["tokens_ids_target"]]
+            inputs_enc = torch.nn.utils.rnn.pad_sequence(batch["token_ids_src"],
+                                                         batch_first=True,
+                                                         padding_value=0)
             seq_length_enc = batch["seq_length_src"]
-            seq_length_decoder = batch["seq_length_target"] - 1
-            seq_length_decoder = torch.where(seq_length_decoder >= 0, seq_length_decoder,
-                                             torch.zeros_like(seq_length_decoder))
-
-            # inspect_batch(tokenizer_src, tokenizer_target, padded_inputs_enc, padded_inputs_dec, padded_outputs_dec)
-            optimizer.zero_grad()
-            if not use_multi_device:
-                logits = wrapped_nn(padded_inputs_enc, seq_length_enc, padded_inputs_dec, seq_length_decoder)
-                loss = loss_fn(logits, padded_outputs_dec, seq_length_decoder)
-                loss = loss / seq_length_enc.sum()
-                loss.backward()
-            else:
-                logits = wrapped_nn(padded_inputs_enc, seq_length_enc, padded_inputs_dec, seq_length_decoder)
-                loss = loss_fn(logits, padded_outputs_dec, seq_length_decoder)  # [n_devices]
-                loss = loss.sum() / seq_length_enc.sum()
-                loss.backward()
-            writer.add_scalar("loss", loss, global_step=n_iter)
-            writer.add_scalar("lr", lr_scheduler.get_last_lr()[0], global_step=n_iter)
-            optimizer.step()
-        lr_scheduler.step()
-
-        with open(os.path.join(model_dir, "model-{}.pt".format(n_iter)), "wb") as f:
-            torch.save(nn.state_dict(), f)
-
-    last_checkpoint = get_last_checkpoint(model_dir)
-    print("Loading checkpoint from {}".format(last_checkpoint))
-    with open(last_checkpoint, "rb") as f:
-        nn.load_state_dict(torch.load(f))
-
-    test_set_cache = os.path.join(cache_dir, "test.pkl")
-    if os.path.exists(test_set_cache):
-        test_set = Dataset.load(test_set_cache)
-    else:
-        test_set = processor.get_test_data()
-        test_set.save(test_set_cache)
-
-    batch_size = 10
-    bos_id = tokenizer_target.convert_tokens_to_ids(["[BOS]"])[0]
-    eos_id = tokenizer_target.convert_tokens_to_ids(["[EOS]"])[0]
-    n_beam = 10
-    dec_hidden_dim = nn.decoder.rnn_cell.weight_hh.size(1)
-    max_output_length = 100
-    print("bos_id: {}, eos_id: {}".format(bos_id, eos_id))
-
-    for batch in DataLoader(test_set,
-                            shuffle=False,
-                            batch_size=batch_size,
-                            collate_fn=functools.partial(collate_fn, device=device)):
-        tokens_src = batch["tokens_src"] if "tokens_src" in batch else [
-            tokenizer_src.convert_ids_to_tokens(item.cpu().numpy()) for item in
-            batch["token_ids_src"]]
-        tokens_target = batch["tokens_target"] if "tokens_target" in batch else [
-            tokenizer_target.convert_ids_to_tokens(item.cpu().numpy()) for item in
-            batch["tokens_ids_target"]]
-        inputs_enc = torch.nn.utils.rnn.pad_sequence(batch["token_ids_src"],
-                                                     batch_first=True,
-                                                     padding_value=0)
-        seq_length_enc = batch["seq_length_src"]
-        current_batch_size = seq_length_enc.size(0)
-        dec_init_state = torch.zeros([current_batch_size, dec_hidden_dim], device=device)
-        decoder_init_input = torch.empty([current_batch_size], dtype=torch.int64, device=device).fill_(bos_id)
-        outputs, output_lengths = nn.beam_search(inputs_enc,
-                                                 seq_length_enc,
-                                                 n_beam=n_beam,
-                                                 eos_id=eos_id,
-                                                 decoder_init_input=decoder_init_input,
-                                                 decoder_init_state=dec_init_state,
-                                                 max_length=max_output_length)
-        outputs = outputs.to("cpu").numpy()
-        output_lengths = output_lengths.to("cpu").numpy()
-        for src, ref, pred, pred_length in zip(tokens_src, tokens_target, outputs, output_lengths):
-            print("Source:", src)
-            print("Reference:", ref)
-            for candidate_i, (pred, pred_length) in enumerate(zip(pred, pred_length)):
-                pred = tokenizer_target.convert_ids_to_tokens(pred.tolist())
-                if pred_length > 0:
-                    pred = pred[:pred_length]
-                print("Candidate {}: {}".format(candidate_i, pred))
+            current_batch_size = seq_length_enc.size(0)
+            dec_init_state = torch.zeros([current_batch_size, dec_hidden_dim], device=device)
+            decoder_init_input = torch.empty([current_batch_size], dtype=torch.int64, device=device).fill_(bos_id)
+            outputs, output_lengths = nn.beam_search(inputs_enc,
+                                                     seq_length_enc,
+                                                     n_beam=n_beam,
+                                                     eos_id=eos_id,
+                                                     decoder_init_input=decoder_init_input,
+                                                     decoder_init_state=dec_init_state,
+                                                     max_length=max_output_length)
+            outputs = outputs.to("cpu").numpy()
+            output_lengths = output_lengths.to("cpu").numpy()
+            for src, ref, pred, pred_length in zip(tokens_src, tokens_target, outputs, output_lengths):
+                print("Source:", src)
+                print("Reference:", ref)
+                for candidate_i, (pred, pred_length) in enumerate(zip(pred, pred_length)):
+                    pred = tokenizer_target.convert_ids_to_tokens(pred.tolist())
+                    if pred_length > 0:
+                        pred = pred[:pred_length]
+                    print("Candidate {}: {}".format(candidate_i, pred))
 
 
 def _get_parser():
@@ -299,6 +304,9 @@ def _get_parser():
     parser.add_argument("--config", type=os.path.normpath,
                         help="Model specification file in JSON format.")
     parser.add_argument("--data-dir", type=os.path.normpath, help="Directory for dataset.")
+    parser.add_argument("--do-train", action="store_true", help="Train the model.")
+    parser.add_argument("--do-predict", action="store_true", help="Predict on test set.")
+
     return parser
 
 

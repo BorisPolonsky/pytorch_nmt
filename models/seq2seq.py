@@ -129,7 +129,7 @@ class Seq2SeqAttn(torch.nn.Module):
                                 encoder_outputs: torch.Tensor,
                                 encoder_seq_length: torch.Tensor,
                                 decoder_cur_inputs: torch.Tensor,
-                                decoder_state: torch.Tensor) -> Tuple[torch.Tensor]:
+                                decoder_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Calculate logits for next word in target language & new state vectors of decoder.
         :param encoder_outputs: torch.Tensor of shape [batch_size, max_seq_len, encoder_output_dim]
@@ -153,7 +153,7 @@ class Seq2SeqAttn(torch.nn.Module):
                     eos_id: int,
                     decoder_init_input: torch.Tensor,
                     decoder_init_state: torch.Tensor,
-                    max_length=10) -> Tuple[torch.Tensor]:
+                    max_length=10) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         :param encoder_inputs: torch.Tensor of shape [batch_size, enc_max_length]
         :param sequence_length: torch.Tensor of shape [batch_size]. Lengths of sequence for encoder.

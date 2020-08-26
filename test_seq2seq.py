@@ -1,6 +1,5 @@
 import torch
 from models.seq2seq import Seq2SeqAttn
-from models.beam_search import beam_search
 from functools import partial
 
 if __name__ == "__main__":
@@ -12,7 +11,7 @@ if __name__ == "__main__":
     enc_hidden_dim = 100
     dec_hidden_dim = 200
     dec_cur_input = torch.tensor([1, 2], device=device)
-    nn = Seq2SeqAttn(vocab_size_f=100, embedding_dim_f=64, vocab_size_e=100, embedding_dim_e=64,
+    nn = Seq2SeqAttn(vocab_size_src=100, embedding_dim_src=64, vocab_size_target=100, embedding_dim_target=64,
                      enc_hidden_dim=enc_hidden_dim,
                      dec_hidden_dim=dec_hidden_dim).to(device)
     init_dec_state = dec_state = torch.zeros([dec_cur_input.size(0), dec_hidden_dim], device=dec_cur_input.device)
@@ -21,4 +20,4 @@ if __name__ == "__main__":
     for i in range(5):
         out, dec_state = decoder_fn(dec_cur_input, dec_state)
     init_dec_input = torch.tensor([2, 2])
-    nn.beam_search(enc_inputs, sequence_length, 10, init_dec_input, init_dec_state, max_length=20)
+    nn.beam_search(enc_inputs, sequence_length, 10, 2, init_dec_input, init_dec_state, max_length=20)
