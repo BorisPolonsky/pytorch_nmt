@@ -6,6 +6,7 @@ from dataset.registry import registry
 from dataset.core import Dataset
 import os
 import functools
+from typing import List
 from models.util import sequence_mask
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
@@ -15,6 +16,7 @@ import itertools
 from parallel import DataParallelCriterion
 import re
 import glob
+import sys
 
 
 class DataParallel(torch.nn.DataParallel):
@@ -120,10 +122,30 @@ def apply_tokenization(dataset: Dataset, tokenizer_src, tokenizer_target):
 
 
 def get_last_checkpoint(checkpoint_dir: str):
-    available_checkpoint_indices = [int(re.search("model-([0-9]*).pt$", path).group(1)) for path in glob.iglob(os.path.join(checkpoint_dir, "model-*pt"))]
-    if not available_checkpoint_indices:
+    checkpoints = []
+    for path in glob.iglob(os.path.join(checkpoint_dir, "model-*")):
+        match = re.search("model-([0-9]*).(pt|pkl)$", path)
+        if match:
+            n_iter = int(match.group(1))
+            checkpoints.append((n_iter, path))
+    if not checkpoints:
         raise ValueError("No state_dict found in ".format(checkpoint_dir))
-    return os.path.join(checkpoint_dir, "model-{}.pt".format(max(available_checkpoint_indices)))
+    n_iter, last_checkpoint = max(checkpoints, key=lambda x: x[0])
+    return last_checkpoint
+
+
+def join_sub_tokens(tokens: List[str]) -> List[str]:
+    output = []
+    for token in tokens:
+        if token.startswith("##"):
+            sub_token = token[2:]
+            if output:
+                output[-1] = output[-1] + sub_token
+            else:
+                output.append(sub_token)
+        else:
+            output.append(token)
+    return output
 
 
 def main(args):
@@ -136,7 +158,7 @@ def main(args):
     if not os.path.exists(cache_dir):
         os.makedirs(cache_dir)
     data_dir = args.data_dir
-    processor = registry.dataset["pytorch-seq2seq-tutorial"](data_dir=data_dir)
+    processor = registry.dataset[args.processor](data_dir=data_dir)
 
     tokenization_config = config["tokenization"]
     tokenizer_src = get_tokenizer(tokenization_config["source"])
@@ -245,7 +267,6 @@ def main(args):
         print("Loading checkpoint from {}".format(last_checkpoint))
         with open(last_checkpoint, "rb") as f:
             nn.load_state_dict(torch.load(f))
-
         test_set_cache = os.path.join(cache_dir, "test.pkl")
         if os.path.exists(test_set_cache):
             test_set = Dataset.load(test_set_cache)
@@ -278,23 +299,64 @@ def main(args):
             current_batch_size = seq_length_enc.size(0)
             dec_init_state = torch.zeros([current_batch_size, dec_hidden_dim], device=device)
             decoder_init_input = torch.empty([current_batch_size], dtype=torch.int64, device=device).fill_(bos_id)
-            outputs, output_lengths = nn.beam_search(inputs_enc,
-                                                     seq_length_enc,
-                                                     n_beam=n_beam,
-                                                     eos_id=eos_id,
-                                                     decoder_init_input=decoder_init_input,
-                                                     decoder_init_state=dec_init_state,
-                                                     max_length=max_output_length)
+            with torch.no_grad():
+                outputs, output_lengths = nn.beam_search(inputs_enc,
+                                                         seq_length_enc,
+                                                         n_beam=n_beam,
+                                                         eos_id=eos_id,
+                                                         decoder_init_input=decoder_init_input,
+                                                         decoder_init_state=dec_init_state,
+                                                         max_length=max_output_length)
             outputs = outputs.to("cpu").numpy()
             output_lengths = output_lengths.to("cpu").numpy()
             for src, ref, pred, pred_length in zip(tokens_src, tokens_target, outputs, output_lengths):
-                print("Source:", src)
-                print("Reference:", ref)
+                print("Source: {}\nSource (without sub-token):{}".format(src, join_sub_tokens(src)))
+                print("Reference:{}\nReference (without sub-token):{}".format(ref, join_sub_tokens(ref)))
                 for candidate_i, (pred, pred_length) in enumerate(zip(pred, pred_length)):
                     pred = tokenizer_target.convert_ids_to_tokens(pred.tolist())
                     if pred_length > 0:
                         pred = pred[:pred_length]
-                    print("Candidate {}: {}".format(candidate_i, pred))
+                    print("Candidate {}: {}\nCandidate {} (without sub-token): {}".format(candidate_i, pred, candidate_i, join_sub_tokens(pred)))
+    if args.do_interactive_predict:
+        last_checkpoint = get_last_checkpoint(model_dir)
+        print("Loading checkpoint from {}".format(last_checkpoint))
+        with open(last_checkpoint, "rb") as f:
+            nn.load_state_dict(torch.load(f))
+        batch_size = 10
+        bos_id = tokenizer_target.convert_tokens_to_ids(["[BOS]"])[0]
+        eos_id = tokenizer_target.convert_tokens_to_ids(["[EOS]"])[0]
+        n_beam = 10
+        dec_hidden_dim = nn.decoder.rnn_cell.weight_hh.size(1)
+        max_output_length = 100
+        print("bos_id: {}, eos_id: {}".format(bos_id, eos_id))
+        while True:
+            print("Source sentence:")
+            text_src = sys.stdin.readline().rstrip()
+            tokens_src = tokenizer_src.tokenize(text_src)
+            print("Tokens (source): {}".format(tokens_src))
+            inputs_enc = torch.tensor([tokenizer_src.convert_tokens_to_ids(tokens_src)], device=device)
+            print(inputs_enc)
+            seq_length_enc = torch.tensor([len(tokens_src)])
+            current_batch_size = 1
+            dec_init_state = torch.zeros([current_batch_size, dec_hidden_dim], device=device)
+            decoder_init_input = torch.empty([current_batch_size], dtype=torch.int64, device=device).fill_(bos_id)
+            with torch.no_grad():
+                outputs, output_lengths = nn.beam_search(inputs_enc,
+                                                         seq_length_enc,
+                                                         n_beam=n_beam,
+                                                         eos_id=eos_id,
+                                                         decoder_init_input=decoder_init_input,
+                                                         decoder_init_state=dec_init_state,
+                                                         max_length=max_output_length)
+            outputs = outputs.to("cpu").numpy()
+            output_lengths = output_lengths.to("cpu").numpy()
+            for src, pred, pred_length in zip(tokens_src, outputs, output_lengths):
+                for candidate_i, (pred, pred_length) in enumerate(zip(pred, pred_length)):
+                    pred = tokenizer_target.convert_ids_to_tokens(pred.tolist())
+                    if pred_length > 0:
+                        pred = pred[:pred_length]
+                        pred_no_sub_token = join_sub_tokens(pred)
+                        print("Candidate {}:\nTokens:{}\nTokens without subword:{}".format(candidate_i, pred, pred_no_sub_token))
 
 
 def _get_parser():
@@ -306,7 +368,8 @@ def _get_parser():
     parser.add_argument("--data-dir", type=os.path.normpath, help="Directory for dataset.")
     parser.add_argument("--do-train", action="store_true", help="Train the model.")
     parser.add_argument("--do-predict", action="store_true", help="Predict on test set.")
-
+    parser.add_argument("--do-interactive-predict", action="store_true", help="Predict on user input.")
+    parser.add_argument("--processor", type=str, help="Processor for dataset.")
     return parser
 
 
