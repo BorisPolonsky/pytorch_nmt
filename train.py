@@ -6,7 +6,8 @@ from dataset.registry import registry
 from dataset.core import Dataset
 import os
 import functools
-from typing import List
+from typing import List, Optional, Dict
+import collections
 from models.util import sequence_mask
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
@@ -108,30 +109,71 @@ def get_tokenizer(config):
     return tokenizer
 
 
-def apply_tokenization(dataset: Dataset, tokenizer_src, tokenizer_target):
-    def add_tokens_n_ids(df, tokenizer, group):
+def apply_tokenization(dataset: Dataset, tokenizer_src, tokenizer_target,
+                       bos: Optional[str] = "[BOS]", eos: Optional[str] = "[EOS]"):
+    def add_tokens_n_ids(df, tokenizer, group,
+                         bos: Optional[str] = None,
+                         eos: Optional[str] = None):
+        def tokenize(text):
+            tokens = tokenizer.tokenize(text)
+            if bos is not None:
+                tokens.insert(0, bos)
+            if eos is not None:
+                tokens.append(eos)
+            return tokens
         token_column = "tokens_{}".format(group)
         token_id_column = "token_ids_{}".format(group)
         if token_column not in df.columns:
-            df[token_column] = df["text_{}".format(group)].apply(tokenizer.tokenize)
+            df[token_column] = df["text_{}".format(group)].apply(tokenize)
         if token_id_column not in df.columns:
             df[token_id_column] = df[token_column].apply(tokenizer.convert_tokens_to_ids)
 
-    add_tokens_n_ids(dataset.df, tokenizer_src, "src")
-    add_tokens_n_ids(dataset.df, tokenizer_target, "target")
+    add_tokens_n_ids(dataset.df, tokenizer_src, "src", bos=None, eos=None)
+    add_tokens_n_ids(dataset.df, tokenizer_target, "target", bos=bos, eos=eos)
 
 
-def get_last_checkpoint(checkpoint_dir: str):
+def get_checkpoints(checkpoint_dir: str):
     checkpoints = []
     for path in glob.iglob(os.path.join(checkpoint_dir, "model-*")):
         match = re.search("model-([0-9]*).(pt|pkl)$", path)
         if match:
             n_iter = int(match.group(1))
             checkpoints.append((n_iter, path))
+    return checkpoints
+
+
+def get_last_checkpoint(checkpoint_dir: str):
+    checkpoints = get_checkpoints(checkpoint_dir)
     if not checkpoints:
         raise ValueError("No state_dict found in ".format(checkpoint_dir))
     n_iter, last_checkpoint = max(checkpoints, key=lambda x: x[0])
     return last_checkpoint
+
+
+def load_pretrained_model(nn, init_checkpoint: str, mapping: Dict = None):
+    loaded_state_dict: collections.OrderedDict = torch.load(init_checkpoint)
+    model_state_dict = collections.OrderedDict(nn.state_dict())
+    loaded_variables = set()
+    if mapping is not None:
+        new_state_dict = collections.OrderedDict()
+        for new_name, old_name in mapping.items():
+            if new_name not in model_state_dict:
+                raise ValueError("{} does not match any parameter in model: {}".format(new_name, [item[0] for item in nn.named_parameters()]))
+            if old_name not in loaded_state_dict:
+                raise ValueError("{} does not match any parameter in checkpoint: {}".format(old_name, [name for name in loaded_state_dict]))
+            new_state_dict[new_name] = loaded_state_dict[old_name]
+        loaded_state_dict = new_state_dict
+        del new_state_dict
+    for name in model_state_dict:
+        if name in loaded_state_dict:
+            model_state_dict[name] = loaded_state_dict[name]
+            loaded_variables.add(name)
+    nn.load_state_dict(model_state_dict)
+    msg = []
+    for name, _ in nn.named_parameters():
+        init_info = "\t****INIT_FROM_CHECKPOINT****" if name in loaded_variables else ""
+        msg.append("Parameter: {}\tSize: {}\tDType: {}{}".format(name, model_state_dict[name].size(), model_state_dict[name].dtype, init_info))
+    print("\n".join(msg))
 
 
 def join_sub_tokens(tokens: List[str]) -> List[str]:
@@ -176,6 +218,9 @@ def main(args):
 
     use_multi_device = torch.cuda.device_count() > 1
     nn = Seq2SeqAttn(**model_args)
+    init_checkpoint = args.init_checkpoint
+    if init_checkpoint is not None:
+        load_pretrained_model(nn, init_checkpoint, model_config.get("checkpoint_mapping", None))
     loss_fn = MaskedCrossEntropyLoss()
     if use_multi_device:
         nn.encoder.flatten_parameters = True
@@ -205,62 +250,62 @@ def main(args):
             training_set = Dataset.load(training_set_cache)
         else:
             training_set = processor.get_train_data()
+            apply_tokenization(training_set, tokenizer_src, tokenizer_target, bos="[BOS]", eos="[EOS]")
             training_set.save(training_set_cache)
-        apply_tokenization(training_set, tokenizer_src, tokenizer_target)
         print(training_set.df.head())
 
-        writer = SummaryWriter(os.path.join(output_dir, "tensorboard"))
-        num_epoch = 20
-        batch_size = 64
-        for epoch_i in range(num_epoch):
-            print("Epoch {}".format(epoch_i))
-            for batch in DataLoader(training_set,
-                                    shuffle=True,
-                                    batch_size=batch_size,
-                                    collate_fn=functools.partial(collate_fn, device=device)):
-                n_iter += 1
-                padded_inputs_enc = torch.nn.utils.rnn.pad_sequence(batch["token_ids_src"],
-                                                                    batch_first=True,
-                                                                    padding_value=0)
-                padded_inputs_dec = torch.nn.utils.rnn.pad_sequence(batch["token_ids_target"],
-                                                                    batch_first=True,
-                                                                    padding_value=0)
-                # Right shift decoder output by one
-                padded_outputs_dec = padded_inputs_dec[:, 1:]
-                padded_inputs_dec = padded_inputs_dec[:, :-1]
-                # teacher_enforcing
-                seq_permute_rate = 0.2
-                token_permute_rate = 0.2
-                teacher_enforcing_mask = torch.rand(padded_inputs_dec.size(),
-                                                    device=padded_inputs_dec.device) >= token_permute_rate
-                teacher_enforcing_mask = (torch.rand([padded_inputs_dec.size(0), 1],
-                                                     device=padded_inputs_dec.device) >= seq_permute_rate) | teacher_enforcing_mask
-                permuted_inputs_dec = torch.randint_like(padded_inputs_dec, 0, vocab_size_target)
-                padded_inputs_dec = torch.where(teacher_enforcing_mask, padded_inputs_dec, permuted_inputs_dec)
-                seq_length_enc = batch["seq_length_src"]
-                seq_length_decoder = batch["seq_length_target"] - 1
-                seq_length_decoder = torch.where(seq_length_decoder >= 0, seq_length_decoder,
-                                                 torch.zeros_like(seq_length_decoder))
+        with SummaryWriter(os.path.join(output_dir, "tensorboard")) as writer:
+            num_epoch = 20
+            batch_size = 64
+            for epoch_i in range(num_epoch):
+                print("Epoch {}".format(epoch_i))
+                for batch in DataLoader(training_set,
+                                        shuffle=True,
+                                        batch_size=batch_size,
+                                        collate_fn=functools.partial(collate_fn, device=device)):
+                    n_iter += 1
+                    padded_inputs_enc = torch.nn.utils.rnn.pad_sequence(batch["token_ids_src"],
+                                                                        batch_first=True,
+                                                                        padding_value=0)
+                    padded_inputs_dec = torch.nn.utils.rnn.pad_sequence(batch["token_ids_target"],
+                                                                        batch_first=True,
+                                                                        padding_value=0)
+                    # Right shift decoder output by one
+                    padded_outputs_dec = padded_inputs_dec[:, 1:]
+                    padded_inputs_dec = padded_inputs_dec[:, :-1]
+                    # teacher_enforcing
+                    seq_permute_rate = 0.2
+                    token_permute_rate = 0.2
+                    teacher_enforcing_mask = torch.rand(padded_inputs_dec.size(),
+                                                        device=padded_inputs_dec.device) >= token_permute_rate
+                    teacher_enforcing_mask = (torch.rand([padded_inputs_dec.size(0), 1],
+                                                         device=padded_inputs_dec.device) >= seq_permute_rate) | teacher_enforcing_mask
+                    permuted_inputs_dec = torch.randint_like(padded_inputs_dec, 0, vocab_size_target)
+                    padded_inputs_dec = torch.where(teacher_enforcing_mask, padded_inputs_dec, permuted_inputs_dec)
+                    seq_length_enc = batch["seq_length_src"]
+                    seq_length_decoder = batch["seq_length_target"] - 1
+                    seq_length_decoder = torch.where(seq_length_decoder >= 0, seq_length_decoder,
+                                                     torch.zeros_like(seq_length_decoder))
 
-                # inspect_batch(tokenizer_src, tokenizer_target, padded_inputs_enc, padded_inputs_dec, padded_outputs_dec)
-                optimizer.zero_grad()
-                if not use_multi_device:
-                    logits = wrapped_nn(padded_inputs_enc, seq_length_enc, padded_inputs_dec, seq_length_decoder)
-                    loss = loss_fn(logits, padded_outputs_dec, seq_length_decoder)
-                    loss = loss / seq_length_enc.sum()
-                    loss.backward()
-                else:
-                    logits = wrapped_nn(padded_inputs_enc, seq_length_enc, padded_inputs_dec, seq_length_decoder)
-                    loss = loss_fn(logits, padded_outputs_dec, seq_length_decoder)  # [n_devices]
-                    loss = loss.sum() / seq_length_enc.sum()
-                    loss.backward()
-                writer.add_scalar("loss", loss, global_step=n_iter)
-                writer.add_scalar("lr", lr_scheduler.get_last_lr()[0], global_step=n_iter)
-                optimizer.step()
-            lr_scheduler.step()
+                    # inspect_batch(tokenizer_src, tokenizer_target, padded_inputs_enc, padded_inputs_dec, padded_outputs_dec)
+                    optimizer.zero_grad()
+                    if not use_multi_device:
+                        logits = wrapped_nn(padded_inputs_enc, seq_length_enc, padded_inputs_dec, seq_length_decoder)
+                        loss = loss_fn(logits, padded_outputs_dec, seq_length_decoder)
+                        loss = loss / seq_length_enc.sum()
+                        loss.backward()
+                    else:
+                        logits = wrapped_nn(padded_inputs_enc, seq_length_enc, padded_inputs_dec, seq_length_decoder)
+                        loss = loss_fn(logits, padded_outputs_dec, seq_length_decoder)  # [n_devices]
+                        loss = loss.sum() / seq_length_enc.sum()
+                        loss.backward()
+                    writer.add_scalar("loss", loss, global_step=n_iter)
+                    writer.add_scalar("lr", lr_scheduler.get_last_lr()[0], global_step=n_iter)
+                    optimizer.step()
+                lr_scheduler.step()
 
-            with open(os.path.join(model_dir, "model-{}.pt".format(n_iter)), "wb") as f:
-                torch.save(nn.state_dict(), f)
+                with open(os.path.join(model_dir, "model-{}.pt".format(n_iter)), "wb") as f:
+                    torch.save(nn.state_dict(), f)
 
     if args.do_predict:
         last_checkpoint = get_last_checkpoint(model_dir)
@@ -272,6 +317,7 @@ def main(args):
             test_set = Dataset.load(test_set_cache)
         else:
             test_set = processor.get_test_data()
+            apply_tokenization(test_set, tokenizer_src, tokenizer_target, bos="[BOS]", eos="[EOS]")
             test_set.save(test_set_cache)
 
         batch_size = 10
@@ -322,7 +368,6 @@ def main(args):
         print("Loading checkpoint from {}".format(last_checkpoint))
         with open(last_checkpoint, "rb") as f:
             nn.load_state_dict(torch.load(f))
-        batch_size = 10
         bos_id = tokenizer_target.convert_tokens_to_ids(["[BOS]"])[0]
         eos_id = tokenizer_target.convert_tokens_to_ids(["[EOS]"])[0]
         n_beam = 10
@@ -335,7 +380,6 @@ def main(args):
             tokens_src = tokenizer_src.tokenize(text_src)
             print("Tokens (source): {}".format(tokens_src))
             inputs_enc = torch.tensor([tokenizer_src.convert_tokens_to_ids(tokens_src)], device=device)
-            print(inputs_enc)
             seq_length_enc = torch.tensor([len(tokens_src)])
             current_batch_size = 1
             dec_init_state = torch.zeros([current_batch_size, dec_hidden_dim], device=device)
@@ -355,8 +399,16 @@ def main(args):
                     pred = tokenizer_target.convert_ids_to_tokens(pred.tolist())
                     if pred_length > 0:
                         pred = pred[:pred_length]
-                        pred_no_sub_token = join_sub_tokens(pred)
-                        print("Candidate {}:\nTokens:{}\nTokens without subword:{}".format(candidate_i, pred, pred_no_sub_token))
+                    pred_no_sub_token = join_sub_tokens(pred)
+                    print("Candidate {}:\nTokens:{}\nTokens without subword:{}".format(candidate_i, pred, pred_no_sub_token))
+    if args.visualize_embedding:
+        for n_iter, path in get_checkpoints(model_dir)[-2:]:
+            with open(path, "rb") as f:
+                nn.load_state_dict(torch.load(f))
+            with SummaryWriter(os.path.join(output_dir, "tensorboard", "projection")) as writer:
+                for name, param in nn.named_parameters():
+                    if "emb" in name:
+                        writer.add_embedding(param.data, global_step=n_iter, tag=name)
 
 
 def _get_parser():
@@ -369,7 +421,10 @@ def _get_parser():
     parser.add_argument("--do-train", action="store_true", help="Train the model.")
     parser.add_argument("--do-predict", action="store_true", help="Predict on test set.")
     parser.add_argument("--do-interactive-predict", action="store_true", help="Predict on user input.")
+    parser.add_argument("--visualize-embedding", action="store_true", help="Predict on user input.")
+    parser.add_argument("--init-checkpoint", default=None, type=str, help="Pretrained model to reload from.")
     parser.add_argument("--processor", type=str, help="Processor for dataset.")
+
     return parser
 
 
