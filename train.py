@@ -18,6 +18,7 @@ from parallel import DataParallelCriterion
 import re
 import glob
 import sys
+from metrics.bleu import compute_bleu, BLEU
 
 
 class DataParallel(torch.nn.DataParallel):
@@ -147,7 +148,7 @@ def get_last_checkpoint(checkpoint_dir: str):
     if not checkpoints:
         raise ValueError("No state_dict found in ".format(checkpoint_dir))
     n_iter, last_checkpoint = max(checkpoints, key=lambda x: x[0])
-    return last_checkpoint
+    return n_iter, last_checkpoint
 
 
 def load_pretrained_model(nn, init_checkpoint: str, mapping: Dict = None):
@@ -188,6 +189,16 @@ def join_sub_tokens(tokens: List[str]) -> List[str]:
         else:
             output.append(token)
     return output
+
+
+def strip_target_sequence(tokens, bos="[BOS]", eos="[EOS]"):
+    # Strip [BOS] and [EOS]
+    out = tokens[:]
+    if out and out[-1] == eos:
+        del out[-1]
+    if out and out[0] == bos:
+        del out[0]
+    return out
 
 
 def main(args):
@@ -306,13 +317,14 @@ def main(args):
 
                 with open(os.path.join(model_dir, "model-{}.pt".format(n_iter)), "wb") as f:
                     torch.save(nn.state_dict(), f)
-
     if args.do_predict:
-        last_checkpoint = get_last_checkpoint(model_dir)
+        raise NotImplementedError("WIP")
+    if args.do_eval:
+        global_step, last_checkpoint = get_last_checkpoint(model_dir)
         print("Loading checkpoint from {}".format(last_checkpoint))
         with open(last_checkpoint, "rb") as f:
             nn.load_state_dict(torch.load(f))
-        test_set_cache = os.path.join(cache_dir, "test.pkl")
+        test_set_cache = os.path.join(cache_dir, "dev.pkl")
         if os.path.exists(test_set_cache):
             test_set = Dataset.load(test_set_cache)
         else:
@@ -320,14 +332,17 @@ def main(args):
             apply_tokenization(test_set, tokenizer_src, tokenizer_target, bos="[BOS]", eos="[EOS]")
             test_set.save(test_set_cache)
 
-        batch_size = 10
+        batch_size = 50
         bos_id = tokenizer_target.convert_tokens_to_ids(["[BOS]"])[0]
         eos_id = tokenizer_target.convert_tokens_to_ids(["[EOS]"])[0]
         n_beam = 10
         dec_hidden_dim = nn.decoder.rnn_cell.weight_hh.size(1)
         max_output_length = 100
         print("bos_id: {}, eos_id: {}".format(bos_id, eos_id))
-
+        bleu_metric_bp = BLEU(max_order=4, use_bp=True)
+        bleu_metric = BLEU(max_order=4, use_bp=False)
+        top_1_bleu_metric_bp = BLEU(max_order=4, use_bp=True)
+        top_1_bleu_metric = BLEU(max_order=4, use_bp=False)
         for batch in DataLoader(test_set,
                                 shuffle=False,
                                 batch_size=batch_size,
@@ -357,14 +372,38 @@ def main(args):
             output_lengths = output_lengths.to("cpu").numpy()
             for src, ref, pred, pred_length in zip(tokens_src, tokens_target, outputs, output_lengths):
                 print("Source: {}\nSource (without sub-token):{}".format(src, join_sub_tokens(src)))
-                print("Reference:{}\nReference (without sub-token):{}".format(ref, join_sub_tokens(ref)))
+                ref_no_sub_token = join_sub_tokens(ref)
+                ref_no_sub_token_ = strip_target_sequence(ref_no_sub_token)
+                print("Reference:{}\nReference (without sub-token):{}".format(ref, ref_no_sub_token))
                 for candidate_i, (pred, pred_length) in enumerate(zip(pred, pred_length)):
                     pred = tokenizer_target.convert_ids_to_tokens(pred.tolist())
                     if pred_length > 0:
                         pred = pred[:pred_length]
-                    print("Candidate {}: {}\nCandidate {} (without sub-token): {}".format(candidate_i, pred, candidate_i, join_sub_tokens(pred)))
+                    pred_no_sub_token = join_sub_tokens(pred)
+                    pred_no_sub_token_ = strip_target_sequence(pred_no_sub_token)
+                    bleu_metric_bp.update_state(ref_no_sub_token_, pred_no_sub_token_)
+                    bleu_metric.update_state(ref_no_sub_token_, pred_no_sub_token_)
+                    if candidate_i == 0:
+                        # Assume that the first candidate is of the highest quality
+                        top_1_bleu_metric_bp.update_state(ref_no_sub_token_, pred_no_sub_token_)
+                        top_1_bleu_metric.update_state(ref_no_sub_token_, pred_no_sub_token_)
+                    current_bleu_bp = compute_bleu(reference_corpus=[ref_no_sub_token_], translation_corpus=[pred_no_sub_token_], max_order=4, use_bp=True)
+                    current_bleu = compute_bleu(reference_corpus=[ref_no_sub_token_], translation_corpus=[pred_no_sub_token_], max_order=4, use_bp=False)
+                    print("Candidate {}:\n- Tokens: {}\n- Sub-tokens: {}\nBLEU/BLEU-with-bp: {}/{}".format(candidate_i, pred_no_sub_token, pred, current_bleu, current_bleu_bp))
+        # Calculate metrics on the whole corpus
+        bleu_val = bleu_metric.result()
+        bleu_bp_val = bleu_metric_bp.result()
+        top_1_bleu_val = top_1_bleu_metric.result()
+        top_1_bleu_bp_val = top_1_bleu_metric_bp.result()
+        print("Metrics:\nBLEU/BLEU-with-bp: {}/{}\nTop-1 BLEU/Top-1 BLEU-with-bp: {}/{}".format(bleu_val, bleu_bp_val, top_1_bleu_val, top_1_bleu_bp_val))
+        with SummaryWriter(os.path.join(output_dir, "tensorboard", "eval")) as writer:
+            writer.add_scalar("BLEU", bleu_val, global_step=global_step)
+            writer.add_scalar("BLEU-with-brevity-penalty", bleu_bp_val, global_step=global_step)
+            writer.add_scalar("BLEU (top-1)", top_1_bleu_val, global_step=global_step)
+            writer.add_scalar("BLEU-with-brevity-penalty (top-1)", top_1_bleu_bp_val, global_step=global_step)
+
     if args.do_interactive_predict:
-        last_checkpoint = get_last_checkpoint(model_dir)
+        global_step, last_checkpoint = get_last_checkpoint(model_dir)
         print("Loading checkpoint from {}".format(last_checkpoint))
         with open(last_checkpoint, "rb") as f:
             nn.load_state_dict(torch.load(f))
@@ -419,6 +458,7 @@ def _get_parser():
                         help="Model specification file in JSON format.")
     parser.add_argument("--data-dir", type=os.path.normpath, help="Directory for dataset.")
     parser.add_argument("--do-train", action="store_true", help="Train the model.")
+    parser.add_argument("--do-eval", action="store_true", help="Evaluate on dev set.")
     parser.add_argument("--do-predict", action="store_true", help="Predict on test set.")
     parser.add_argument("--do-interactive-predict", action="store_true", help="Predict on user input.")
     parser.add_argument("--visualize-embedding", action="store_true", help="Predict on user input.")
