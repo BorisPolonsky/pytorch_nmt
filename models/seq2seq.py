@@ -72,6 +72,43 @@ class Decoder(torch.nn.Module):
         return out
 
 
+class GatedAttnDecoder(torch.nn.Module):
+    def __init__(self, embedding, rnn_cell: torch.nn.RNNCellBase, gate_hidden_dim):
+        super(GatedAttnDecoder, self).__init__()
+        self.embedding = embedding
+        self.rnn_cell = rnn_cell
+        rnn_state_dim = rnn_cell.hidden_size
+        embedding_dim = embedding.embedding_dim
+        self.fc1 = torch.nn.Linear(rnn_state_dim + embedding_dim, gate_hidden_dim)
+        self.activation1 = torch.nn.GELU()
+        self.fc2 = torch.nn.Linear(gate_hidden_dim, 1)
+        self.activation2 = torch.nn.Sigmoid()
+
+    def forward(self, inputs, state, context):
+        """
+        Intuition: In machine translation, you don't always need to attend to a specific word in source sentence.
+        Applying gate on context vector controls whether the next word to be predicted takes into account
+        certain words in source sentence (i.e. when context gate values approaches 1) or not (i.e. purely
+        depends on LM of target language with gate value close to 0, in case the next token depends solely on
+        grammatical constraints, the need for BPE completion, e.t.c.).
+        :param inputs: torch.Tensor of shape [batch_size]
+        :param state: torch.Tensor of shape [batch_size, state_dim]
+        :param context: torch.Tensor of shape [batch_size, context_dim]
+        :return:
+        """
+        out = self.embedding(inputs)  # [batch_size, embedding_dim]
+        # Two fc layers for context gate computation
+        gate = self.fc1(torch.cat([out, state], dim=1))
+        gate = self.activation1(gate)
+        gate = self.fc2(gate)
+        gate = self.activation2(gate)  # [batch_size, 1]
+        # apply gate on context
+        context = torch.mul(gate, context)
+        out = torch.cat([out, context], dim=1)
+        out = self.rnn_cell(out, state)
+        return out
+
+
 class Seq2SeqAttn(torch.nn.Module):
     def __init__(self, vocab_size_src, embedding_dim_src, vocab_size_target, embedding_dim_target,
                  enc_hidden_dim, dec_hidden_dim):
@@ -265,3 +302,32 @@ class Seq2SeqAttn(torch.nn.Module):
         hypothesis_pool = hypothesis_pool.reshape([batch_size, n_beam, -1])
         hypothesis_length = hypothesis_length.reshape([batch_size, n_beam])
         return hypothesis_pool, hypothesis_length
+
+
+class GatedSeq2SeqAttn(Seq2SeqAttn):
+    def __init__(self, vocab_size_src, embedding_dim_src, vocab_size_target, embedding_dim_target,
+                 enc_hidden_dim, dec_hidden_dim, context_gate_hidden_dim):
+        """
+        :param vocab_size_src: Size of vocabulary of original language.
+        :param embedding_dim_src:
+        :param vocab_size_target: Size of vocabulary of target language.
+        :param embedding_dim_target:
+        :param enc_hidden_dim:
+        :param dec_hidden_dim:
+        """
+        super(Seq2SeqAttn, self).__init__()
+        enc_embd = torch.nn.Embedding(vocab_size_src, embedding_dim_src, padding_idx=0)
+        enc_rnn = torch.nn.LSTM(input_size=embedding_dim_src, hidden_size=enc_hidden_dim, batch_first=True,
+                                bidirectional=True)
+        self.encoder = Encoder(enc_embd, enc_rnn)
+
+        dec_embd = torch.nn.Embedding(vocab_size_target, embedding_dim_target, padding_idx=0)
+        dec_rnn_cell = torch.nn.GRUCell(input_size=2 * enc_hidden_dim + embedding_dim_target,
+                                        hidden_size=dec_hidden_dim)
+        self.decoder = GatedAttnDecoder(dec_embd, rnn_cell=dec_rnn_cell, gate_hidden_dim=context_gate_hidden_dim)
+
+        self.attn = ConcatAttention(2 * enc_hidden_dim + dec_hidden_dim, hidden_dim=8)
+        self.clf = torch.nn.Sequential(torch.nn.Linear(dec_hidden_dim, vocab_size_target),
+                                       torch.nn.ReLU())
+        # TODO: Initialize bias of clf layer to penalize words that are not included in the training set.
+        self._dec_hidden_dim = dec_hidden_dim
