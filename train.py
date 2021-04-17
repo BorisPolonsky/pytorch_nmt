@@ -229,9 +229,19 @@ def main(args):
 
     use_multi_device = torch.cuda.device_count() > 1
     nn = Seq2SeqAttn(**model_args)
+
+    # Load and print weights from pretrained model
     init_checkpoint = args.init_checkpoint
     if init_checkpoint is not None:
-        load_pretrained_model(nn, init_checkpoint, model_config.get("checkpoint_mapping", None))
+        var_from_checkpoint = load_pretrained_model(nn, init_checkpoint, model_config.get("checkpoint_mapping", None))
+    else:
+        var_from_checkpoint = set()
+    msg = []
+    for name, param in nn.named_parameters():
+        init_info = "\t****INIT_FROM_CHECKPOINT****" if name in var_from_checkpoint else ""
+        msg.append("Parameter: {}\tSize: {}\tDType: {}{}".format(name, param.size(), param.dtype, init_info))
+    print("\n".join(msg))
+    del msg
     loss_fn = MaskedCrossEntropyLoss()
     if use_multi_device:
         nn.encoder.flatten_parameters = True
@@ -240,8 +250,6 @@ def main(args):
         loss_fn = DataParallelCriterion(loss_fn)
     else:
         wrapped_nn = nn = nn.to(device)
-
-    print([name for name, param in nn.named_parameters()])
 
     optimizer_config = config["optimizer"]
     optimizer_cls = torch.optim.SGD  # No support for other optimizers for now
@@ -464,7 +472,6 @@ def _get_parser():
     parser.add_argument("--visualize-embedding", action="store_true", help="Predict on user input.")
     parser.add_argument("--init-checkpoint", default=None, type=str, help="Pretrained model to reload from.")
     parser.add_argument("--processor", type=str, help="Processor for dataset.")
-
     return parser
 
 
