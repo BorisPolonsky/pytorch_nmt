@@ -1,6 +1,6 @@
 import torch
 from typing import Tuple
-from .attention import ConcatAttention
+from .attention import ConcatAttention, BiLinearAttention, DotAttention
 import torch.nn.functional as F
 
 
@@ -111,7 +111,7 @@ class GatedAttnDecoder(torch.nn.Module):
 
 class Seq2SeqAttn(torch.nn.Module):
     def __init__(self, vocab_size_src, embedding_dim_src, vocab_size_target, embedding_dim_target,
-                 enc_hidden_dim, dec_hidden_dim):
+                 enc_hidden_dim, dec_hidden_dim, attention_type="concat", attention_hidden_dim=None):
         """
         :param vocab_size_src: Size of vocabulary of original language.
         :param embedding_dim_src:
@@ -119,6 +119,8 @@ class Seq2SeqAttn(torch.nn.Module):
         :param embedding_dim_target:
         :param enc_hidden_dim:
         :param dec_hidden_dim:
+        :param attention_type: "concat"/"dot"/"bi-linear"
+        :param attention_hidden_dim: [Optional] Dimension of hidden layer of attention mechanism if `attention_type` is specified as "concat".
         """
         super().__init__()
         enc_embd = torch.nn.Embedding(vocab_size_src, embedding_dim_src, padding_idx=0)
@@ -129,8 +131,16 @@ class Seq2SeqAttn(torch.nn.Module):
         dec_embd = torch.nn.Embedding(vocab_size_target, embedding_dim_target, padding_idx=0)
         dec_rnn_cell = torch.nn.GRUCell(input_size=2 * enc_hidden_dim + embedding_dim_target, hidden_size=dec_hidden_dim)
         self.decoder = Decoder(dec_embd, rnn_cell=dec_rnn_cell)
-
-        self.attn = ConcatAttention(2 * enc_hidden_dim + dec_hidden_dim, hidden_dim=8)
+        if attention_type == "concat":
+            self.attn = ConcatAttention(2 * enc_hidden_dim + dec_hidden_dim, hidden_dim=attention_hidden_dim)
+        elif attention_type == "dot":
+            if 2 * enc_hidden_dim != dec_hidden_dim:
+                raise ValueError("Mismatched dimension for encoder output ({}) and decoder state ({}).".format(2 * enc_hidden_dim, dec_hidden_dim))
+            self.attn = DotAttention()
+        elif attention_type == "bi-linear":
+            self.attn = BiLinearAttention(2 * enc_hidden_dim, dec_hidden_dim)
+        else:
+            raise ValueError('Unknown value for "attention_type": {}'.format(attention_type))
         self.clf = torch.nn.Sequential(torch.nn.Linear(dec_hidden_dim, vocab_size_target),
                                        torch.nn.ReLU())
         # TODO: Initialize bias of clf layer to penalize words that are not included in the training set.
@@ -306,7 +316,8 @@ class Seq2SeqAttn(torch.nn.Module):
 
 class GatedSeq2SeqAttn(Seq2SeqAttn):
     def __init__(self, vocab_size_src, embedding_dim_src, vocab_size_target, embedding_dim_target,
-                 enc_hidden_dim, dec_hidden_dim, context_gate_hidden_dim):
+                 enc_hidden_dim, dec_hidden_dim, context_gate_hidden_dim,
+                 attention_type="concat", attention_hidden_dim=None):
         """
         :param vocab_size_src: Size of vocabulary of original language.
         :param embedding_dim_src:
@@ -325,8 +336,16 @@ class GatedSeq2SeqAttn(Seq2SeqAttn):
         dec_rnn_cell = torch.nn.GRUCell(input_size=2 * enc_hidden_dim + embedding_dim_target,
                                         hidden_size=dec_hidden_dim)
         self.decoder = GatedAttnDecoder(dec_embd, rnn_cell=dec_rnn_cell, gate_hidden_dim=context_gate_hidden_dim)
-
-        self.attn = ConcatAttention(2 * enc_hidden_dim + dec_hidden_dim, hidden_dim=8)
+        if attention_type == "concat":
+            self.attn = ConcatAttention(2 * enc_hidden_dim + dec_hidden_dim, hidden_dim=200)
+        elif attention_type == "dot":
+            if 2 * enc_hidden_dim != dec_hidden_dim:
+                raise ValueError("Mismatched dimension for encoder output ({}) and decoder state ({}).".format(2 * enc_hidden_dim, dec_hidden_dim))
+            self.attn = DotAttention()
+        elif attention_type == "bi-linear":
+            self.attn = BiLinearAttention(2 * enc_hidden_dim, dec_hidden_dim)
+        else:
+            raise ValueError('Unknown value for "attention_type": {}'.format(attention_type))
         self.clf = torch.nn.Sequential(torch.nn.Linear(dec_hidden_dim, vocab_size_target),
                                        torch.nn.ReLU())
         # TODO: Initialize bias of clf layer to penalize words that are not included in the training set.

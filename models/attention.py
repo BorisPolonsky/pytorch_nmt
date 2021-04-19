@@ -93,7 +93,7 @@ class DotAttention(torch.nn.Module):
     Calculate attention score as:
     score(h_i, s_j) = h_{i}^{T}s_{j}
     """
-    def __init__(self, encoder_state_dim, decoder_state_dim):
+    def __init__(self):
         super().__init__()
         self.mask_val = -50000
 
