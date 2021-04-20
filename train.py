@@ -170,11 +170,7 @@ def load_pretrained_model(nn, init_checkpoint: str, mapping: Dict = None):
             model_state_dict[name] = loaded_state_dict[name]
             loaded_variables.add(name)
     nn.load_state_dict(model_state_dict)
-    msg = []
-    for name, _ in nn.named_parameters():
-        init_info = "\t****INIT_FROM_CHECKPOINT****" if name in loaded_variables else ""
-        msg.append("Parameter: {}\tSize: {}\tDType: {}{}".format(name, model_state_dict[name].size(), model_state_dict[name].dtype, init_info))
-    print("\n".join(msg))
+    return loaded_variables
 
 
 def join_sub_tokens(tokens: List[str]) -> List[str]:
@@ -241,7 +237,7 @@ def main(args):
         init_info = "\t****INIT_FROM_CHECKPOINT****" if name in var_from_checkpoint else ""
         msg.append("Parameter: {}\tSize: {}\tDType: {}{}".format(name, param.size(), param.dtype, init_info))
     print("\n".join(msg))
-    del msg
+    del msg, var_from_checkpoint
     loss_fn = MaskedCrossEntropyLoss()
     if use_multi_device:
         nn.encoder.flatten_parameters = True
