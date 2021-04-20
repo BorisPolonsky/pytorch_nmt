@@ -160,7 +160,6 @@ class DataParallelCriterion(DataParallel):
         outputs = _criterion_parallel_apply(replicas, inputs, targets, kwargs)
         #return Reduce.apply(*outputs) / len(outputs)
         #return self.gather(outputs, self.output_device).mean()
-        print("===", outputs.shape, outputs.device)
         return self.gather(outputs, self.output_device)
 
 
