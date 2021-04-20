@@ -26,6 +26,7 @@ class Decoder(torch.nn.Module):
         super().__init__()
         self.embedding = embedding
         self.rnn_cell = rnn_cell
+        # TODO: wrap implementation of `forward_fn` in torch.nn.module, otherwise multi-device training breaks
         if context_aggr_type == "pre-concat":
             self.forward_fn = self._pre_concat_forward_fn
         elif context_aggr_type == "post-concat":
@@ -132,6 +133,8 @@ class Seq2SeqAttn(torch.nn.Module):
         dec_rnn_cell = torch.nn.GRUCell(input_size=2 * enc_hidden_dim + embedding_dim_target, hidden_size=dec_hidden_dim)
         self.decoder = Decoder(dec_embd, rnn_cell=dec_rnn_cell)
         if attention_type == "concat":
+            if attention_hidden_dim is None:
+                raise ValueError('Missing value "attention_hidden_dim".')
             self.attn = ConcatAttention(2 * enc_hidden_dim + dec_hidden_dim, hidden_dim=attention_hidden_dim)
         elif attention_type == "dot":
             if 2 * enc_hidden_dim != dec_hidden_dim:
