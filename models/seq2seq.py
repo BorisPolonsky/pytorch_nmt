@@ -26,7 +26,10 @@ class Decoder(torch.nn.Module):
         super().__init__()
         self.embedding = embedding
         self.rnn_cell = rnn_cell
-        # TODO: wrap implementation of `forward_fn` in torch.nn.module, otherwise multi-device training breaks
+        # Caveat: Do not use `self.module_name` for submodule reference
+        # in actual implementation of `self.forward_fn`, pass them as input parameters instead,
+        # otherwise some of input parameter of `self.forward_fn` won't be allocated to the correct device
+        # in multi-device training scenarios when actual implementation is called.
         if context_aggr_type == "pre-concat":
             self.forward_fn = self._pre_concat_forward_fn
         elif context_aggr_type == "post-concat":
@@ -42,33 +45,34 @@ class Decoder(torch.nn.Module):
         :param context: torch.Tensor of shape [batch_size, context_dim]
         :return:
         """
-        return self.forward_fn(inputs, state, context)
+        input_embedding = self.embedding(inputs)  # [batch_size, embedding_dim]
+        return self.forward_fn(self.rnn_cell, input_embedding, state, context)
 
-    def _pre_concat_forward_fn(self, inputs: torch.Tensor, state: torch.Tensor, context: torch.Tensor):
+    @classmethod
+    def _pre_concat_forward_fn(cls, cell, inputs: torch.Tensor, state: torch.Tensor, context: torch.Tensor):
         """
         Aggregate context before rnn layer as defined in
-        Neural Machine Translation by Jointly Learning to Align and Translate
-        :param inputs: torch.Tensor of shape [batch_size]
+        <Neural Machine Translation by Jointly Learning to Align and Translate>
+        :param inputs: torch.Tensor of shape [batch_size, embedding_dim].
         :param state: torch.Tensor of shape [batch_size, state_dim]
         :param context: torch.Tensor of shape [batch_size, context_dim]
         :return:
         """
-        out = self.embedding(inputs)  # [batch_size, embedding_dim]
-        out = torch.cat([out, context], dim=1)
-        out = self.rnn_cell(out, state)
+        out = torch.cat([inputs, context], dim=1)
+        out = cell(out, state)
         return out
 
-    def _post_concat_forward_fn(self, inputs: torch.Tensor, state: torch.Tensor, context: torch.Tensor):
+    @classmethod
+    def _post_concat_forward_fn(cls, cell, inputs: torch.Tensor, state: torch.Tensor, context: torch.Tensor):
         """
         Aggregate context after applying rnn layer as defined in
-        Get To The Point: Summarization with Pointer-Generator Networks
-        :param inputs: torch.Tensor of shape [batch_size]
+        <Get To The Point: Summarization with Pointer-Generator Networks>
+        :param inputs: torch.Tensor of shape [batch_size, embedding_dim]
         :param state: torch.Tensor of shape [batch_size, state_dim]
         :param context: torch.Tensor of shape [batch_size, context_dim]
         :return:
         """
-        out = self.embedding(inputs)  # [batch_size, embedding_dim]
-        out = self.rnn_cell(out, state)
+        out = cell(inputs, state)
         out = torch.cat([out, context], dim=1)
         return out
 
