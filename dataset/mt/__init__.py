@@ -1,1 +1,2 @@
 from dataset.mt.pytorch_tutorial import EngFraDataProcessor
+from dataset.mt.translation2019zh import Translation2019ZhProcessor
