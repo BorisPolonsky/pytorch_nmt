@@ -1,6 +1,7 @@
 import torch
 from typing import Tuple
 from .attention import ConcatAttention, BiLinearAttention, DotAttention
+from .util import sequence_mask
 import torch.nn.functional as F
 
 
@@ -17,8 +18,14 @@ class Encoder(torch.nn.Module):
         if self.flatten_parameters:
             self.rnn.flatten_parameters()
         out, last_state = self.rnn(out)
-        out = torch.nn.utils.rnn.pad_packed_sequence(out, batch_first=True)[0]
-        return out, last_state
+        out, out_length = torch.nn.utils.rnn.pad_packed_sequence(out, batch_first=True)
+        # Batch First
+        if isinstance(last_state, tuple):
+            last_state = tuple(torch.transpose(tensor, 0, 1) for tensor in last_state)
+        else:
+            last_state = torch.transpose(last_state, 0, 1)
+        output_mask = sequence_mask(out_length.to(out.device), maxlen=inputs.size(1))
+        return out, last_state, output_mask
 
 
 class Decoder(torch.nn.Module):
@@ -96,6 +103,13 @@ class GatedAttnDecoder(torch.nn.Module):
         certain words in source sentence (i.e. when context gate values approaches 1) or not (i.e. purely
         depends on LM of target language with gate value close to 0, in case the next token depends solely on
         grammatical constraints, the need for BPE completion, e.t.c.).
+
+        Update: This mechanism doesn't seem to bring significant improvement if
+         - LSTM/GRU is used as decoder and,
+         - the context vector is calculated BEFORE decoder state update,
+        since the information in context vector is already to some extent controlled by input gate of LSTM cell.
+        The context gate will constantly yield values near to 1. when trained on some
+        Machine Translation Task.
         :param inputs: torch.Tensor of shape [batch_size]
         :param state: torch.Tensor of shape [batch_size, state_dim]
         :param context: torch.Tensor of shape [batch_size, context_dim]
@@ -170,35 +184,35 @@ class Seq2SeqAttn(torch.nn.Module):
         batch_size = decoder_inputs.size(1)
         decoder_state = torch.zeros([batch_size, self._dec_hidden_dim], device=decoder_inputs.device)
         decoder_outputs = []
-        encoder_outputs, last_state = self.encoder(encoder_inputs, encoder_seq_length)
-
+        encoder_outputs, last_state, enc_output_mask = self.encoder(encoder_inputs, encoder_seq_length)
         for decoder_cur_inputs in decoder_inputs:
-            dec_out, decoder_state = self.decode_one_step_forward(encoder_outputs, encoder_seq_length,
+            dec_out, decoder_state = self.decode_one_step_forward(encoder_outputs, enc_output_mask,
                                                                   decoder_cur_inputs, decoder_state)
             decoder_outputs.append(dec_out)
         decoder_outputs = torch.stack(decoder_outputs, dim=1)
-        return decoder_outputs
+        logits = self.clf(decoder_outputs)
+        return logits
 
     def decode_one_step_forward(self,
                                 encoder_outputs: torch.Tensor,
-                                encoder_seq_length: torch.Tensor,
+                                mask: torch.Tensor,
                                 decoder_cur_inputs: torch.Tensor,
                                 decoder_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Calculate logits for next word in target language & new state vectors of decoder.
         :param encoder_outputs: torch.Tensor of shape [batch_size, max_seq_len, encoder_output_dim]
-        :param encoder_seq_length: torch.Tensor of shape [batch_size]
+        :param mask: torch.Tensor of shape [batch_size, max_seq_len]
         :param decoder_cur_inputs: torch.Tensor of shape [batch_size]
         :param decoder_state: torch.Tensor
-        :return: (logits, state)
-                - logits: torch.Tensor of shape [batch_size, vocab_size_e], logits for predicting next word.
+        :return: (output, state)
+                - output: torch.Tensor of shape [batch_size, decoder_output_dim], current decoder output.
+                Here the updated state of decoder is used as output
                 - state: torch.Tensor of shape [batch_size, decoder_hidden_dim], updated state of decoder
         """
-        context, _ = self.attn(encoder_outputs=encoder_outputs, sequence_length=encoder_seq_length,
+        context, _ = self.attn(encoder_outputs=encoder_outputs, mask=mask,
                                decoder_state=decoder_state)
         new_state = self.decoder(decoder_cur_inputs, decoder_state, context)
-        out = self.clf(new_state)
-        return out, new_state
+        return new_state, new_state
 
     def beam_search(self,
                     encoder_inputs: torch.Tensor,
@@ -227,9 +241,11 @@ class Seq2SeqAttn(torch.nn.Module):
         batch_size = decoder_init_input.size(0)
         dec_cur_input = decoder_init_input  # [batch_size]
         dec_state = decoder_init_state  # [batch_size, decoder_state_dim]
-        enc_outputs, _ = self.encoder(encoder_inputs, sequence_length)  # [batch_size, encoder_max_seq_length, encoder_output_dim]
-        # logits: [batch_size, vocab_size], dec_state: [batch_size, decoder_state_dim]
-        logits, dec_state = self.decode_one_step_forward(enc_outputs, sequence_length, dec_cur_input, dec_state)
+        enc_outputs, _, enc_output_mask = self.encoder(encoder_inputs, sequence_length)  # [batch_size, encoder_max_seq_length, encoder_output_dim]
+        # dec_state: [batch_size, decoder_state_dim]
+        dec_output, dec_state = self.decode_one_step_forward(enc_outputs, enc_output_mask, dec_cur_input, dec_state)
+        # logits: [batch_size, vocab_size]
+        logits = dec_output = self.clf(dec_output)
         vocab_size = logits.size(-1)
         assert 0 <= eos_id < vocab_size
         acc_log_probs = F.log_softmax(logits, dim=-1)  # [batch_size, vocab_size]
@@ -241,9 +257,9 @@ class Seq2SeqAttn(torch.nn.Module):
         vocab_ids_t = vocab_ids_t.flatten()  # [batch_size * n_beam]
         vocab_ids.append(vocab_ids_t)
         # expand batch: batch_size -> batch_size * n_beam
-        sequence_length = sequence_length.unsqueeze(1).expand([-1, n_beam]).flatten()  # [batch_size * n_beam)]
         enc_outputs = enc_outputs.unsqueeze(1).expand([-1, n_beam, -1, -1])  # [batch_size, n_beam, encoder_max_seq_length, encoder_output_dim]
         enc_outputs = enc_outputs.flatten(start_dim=0, end_dim=1)  # [batch_size * n_beam, encoder_max_seq_length, encoder_output_dim]
+        enc_output_mask = torch.repeat_interleave(enc_output_mask, n_beam, dim=0)
         dec_state = dec_state.unsqueeze(1).expand([-1, n_beam, -1]).flatten(start_dim=0, end_dim=1)  # [batch_size * n_beam, decoder_state_dim]
         dec_cur_input = vocab_ids_t.flatten()  # [batch_size * n_beam]
         is_terminal = (dec_cur_input == eos_id)  # [batch_size * n_beam]
@@ -252,9 +268,10 @@ class Seq2SeqAttn(torch.nn.Module):
         for i in torch.arange(1, max_length):
             if torch.all(is_terminal):
                 break
-            # logits: [batch_size * n_beam, vocab_size], dec_state: [batch_size * n_beam, decoder_dim]
-            logits, dec_state = self.decode_one_step_forward(enc_outputs, sequence_length, dec_cur_input, dec_state)
-
+            # dec_state: [batch_size * n_beam, decoder_dim]
+            dec_output, dec_state = self.decode_one_step_forward(enc_outputs, enc_output_mask, dec_cur_input, dec_state)
+            # logits: [batch_size * n_beam, vocab_size]
+            logits = dec_output = self.clf(dec_output)
             log_probs_t = F.log_softmax(logits, dim=-1)  # [batch_size * n_beam, vocab_size]
             # [batch_size, k_prev, 1] + [batch_size, n_beam, vocab_size]
             # calculate increment of acc_log_probs

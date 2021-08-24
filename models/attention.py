@@ -1,17 +1,15 @@
 import torch
-from .util import sequence_mask
 import math
 from typing import Tuple
 
 
-def masked_softmax(logits: torch.Tensor, sequence_length: torch.Tensor, mask_val=-50000) -> torch.Tensor:
+def masked_softmax(logits: torch.Tensor, mask: torch.Tensor, mask_val=-50000) -> torch.Tensor:
     """
     :param logits: torch.Tensor of shape [batch_size, seq_len]
-    :param sequence_length: torch.Tensor of shape [batch_size]
+    :param mask: torch.Tensor of shape [batch_size, seq_len]
     :param mask_val: an negative integer for masking logits before applying softmax function.
     :return: torch.Tensor of shape [batch_size, seq_len]
     """
-    mask = sequence_mask(sequence_length, maxlen=logits.size(1)).to(logits.device)
     masked_logits = torch.where(mask, logits, torch.empty_like(logits).fill_(mask_val))
     out = torch.softmax(masked_logits, dim=1)
     return out
@@ -33,11 +31,11 @@ class ConcatAttention(torch.nn.Module):
         self.fc_v = torch.nn.Linear(hidden_dim, 1, bias=False)
         self.mask_val = -50000
 
-    def forward(self, encoder_outputs: torch.Tensor, sequence_length: torch.Tensor, decoder_state: torch.Tensor) -> Tuple[torch.Tensor]:
+    def forward(self, encoder_outputs: torch.Tensor, mask: torch.Tensor, decoder_state: torch.Tensor) -> Tuple[torch.Tensor]:
         """
 
         :param encoder_outputs: torch.Tensor of shape [batch_size, enc_seq_len, enc_state_dim]
-        :param sequence_length: torch.Tensor of shape [batch_size]
+        :param mask: torch.Tensor of shape [batch_size, enc_seq_len]
         :param decoder_state: torch.Tensor of shape [batch_size, dec_state_dim]
         :return: tuple of (out, attn_weight)
             - out: torch.Tensor of shape [batch_size, enc_seq_len, enc_state_dim], output with attention applied
@@ -47,7 +45,7 @@ class ConcatAttention(torch.nn.Module):
         attn_logits = self.fc_w(out)  # [batch_size, enc_seq_len, hidden_dim]
         attn_logits = attn_logits.tanh()
         attn_logits = self.fc_v(attn_logits).squeeze(2)  # [batch_size, enc_seq_len]
-        attn_weight = masked_softmax(attn_logits, sequence_length, mask_val=self.mask_val)  # [batch_size, enc_seq_len]
+        attn_weight = masked_softmax(attn_logits, mask, mask_val=self.mask_val)  # [batch_size, enc_seq_len]
         out = torch.bmm(attn_weight.unsqueeze(1), encoder_outputs).squeeze(1)
         return out, attn_weight
 
@@ -69,11 +67,11 @@ class BiLinearAttention(torch.nn.Module):
         bound = 1 / math.sqrt(self.weight.size(0))
         torch.nn.init.uniform_(self.weight, -bound, bound)
 
-    def forward(self, encoder_outputs: torch.Tensor, sequence_length: torch.Tensor, decoder_state: torch.Tensor) -> Tuple[torch.Tensor]:
+    def forward(self, encoder_outputs: torch.Tensor, mask: torch.Tensor, decoder_state: torch.Tensor) -> Tuple[torch.Tensor]:
         """
 
         :param encoder_outputs: torch.Tensor of shape [batch_size, enc_seq_len, enc_state_dim]
-        :param sequence_length: torch.Tensor of shape [batch_size]
+        :param mask: torch.Tensor of shape [batch_size, enc_seq_len]
         :param decoder_state: torch.Tensor of shape [batch_size, dec_state_dim]
         :return: tuple of (out, attn_weight)
             - out: torch.Tensor of shape [batch_size, enc_seq_len, enc_state_dim], output with attention applied
@@ -83,7 +81,7 @@ class BiLinearAttention(torch.nn.Module):
         s = decoder_state  # [batch_size, dec_state_dim]
         Ws_ = torch.matmul(s, self.weight).unsqueeze(-1)  # [batch_size, enc_state_dim, 1]
         attn_logits = torch.bmm(h, Ws_).squeeze(-1)  # [batch_size, enc_seq_len]
-        attn_weight = masked_softmax(attn_logits, sequence_length, mask_val=self.mask_val)  # [batch_size, enc_seq_len]
+        attn_weight = masked_softmax(attn_logits, mask, mask_val=self.mask_val)  # [batch_size, enc_seq_len]
         out = torch.bmm(attn_weight.unsqueeze(1), encoder_outputs).squeeze(1)
         return out, attn_weight
 
@@ -97,11 +95,11 @@ class DotAttention(torch.nn.Module):
         super().__init__()
         self.mask_val = -50000
 
-    def forward(self, encoder_outputs: torch.Tensor, sequence_length: torch.Tensor, decoder_state: torch.Tensor) -> Tuple[torch.Tensor]:
+    def forward(self, encoder_outputs: torch.Tensor, mask: torch.Tensor, decoder_state: torch.Tensor) -> Tuple[torch.Tensor]:
         """
 
         :param encoder_outputs: torch.Tensor of shape [batch_size, enc_seq_len, state_dim]
-        :param sequence_length: torch.Tensor of shape [batch_size]
+        :param mask: torch.Tensor of shape [batch_size, enc_seq_len]
         :param decoder_state: torch.Tensor of shape [batch_size, state_dim]
         :return: tuple of (out, attn_weight)
             - out: torch.Tensor of shape [batch_size, enc_seq_len, state_dim], output with attention applied
@@ -110,6 +108,6 @@ class DotAttention(torch.nn.Module):
         h = encoder_outputs  # [batch_size, enc_seq_len, state_dim]
         s = decoder_state.unsqueeze(-1)  # [batch_size, state_dim, 1]
         attn_logits = torch.bmm(h, s).squeeze(-1)  # [batch_size, enc_seq_len]
-        attn_weight = masked_softmax(attn_logits, sequence_length, mask_val=self.mask_val) # [batch_size, enc_seq_len]
+        attn_weight = masked_softmax(attn_logits, mask, mask_val=self.mask_val) # [batch_size, enc_seq_len]
         out = torch.bmm(attn_weight.unsqueeze(1), encoder_outputs).squeeze(1)
         return out, attn_weight
